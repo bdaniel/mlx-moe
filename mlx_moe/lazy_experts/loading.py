@@ -26,9 +26,15 @@ def _find_switch_mlp(layer, layer_idx=None):
         key_base = f"{prefix}.mlp.switch_mlp" if prefix else "mlp.switch_mlp"
         return switch, key_base
 
-    if hasattr(layer, "block_sparse_moe") and hasattr(layer.block_sparse_moe, "switch_mlp"):
+    if hasattr(layer, "block_sparse_moe") and hasattr(
+        layer.block_sparse_moe, "switch_mlp"
+    ):
         switch = layer.block_sparse_moe.switch_mlp
-        key_base = f"{prefix}.block_sparse_moe.switch_mlp" if prefix else "block_sparse_moe.switch_mlp"
+        key_base = (
+            f"{prefix}.block_sparse_moe.switch_mlp"
+            if prefix
+            else "block_sparse_moe.switch_mlp"
+        )
         return switch, key_base
 
     return None, None
@@ -42,7 +48,9 @@ def _find_moe_block(layer):
     """
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp"):
         return layer.mlp
-    if hasattr(layer, "block_sparse_moe") and hasattr(layer.block_sparse_moe, "switch_mlp"):
+    if hasattr(layer, "block_sparse_moe") and hasattr(
+        layer.block_sparse_moe, "switch_mlp"
+    ):
         return layer.block_sparse_moe
     return None
 
@@ -71,6 +79,25 @@ def _build_shard_map(model_path: Path) -> dict[str, str]:
 
     shard_map = {key: str(model_path / shard) for key, shard in weight_map.items()}
 
+    # Normalize keys to strip prefixes that mlx-lm strips during loading.
+    # E.g. "language_model.model.layers.0..." -> "model.layers.0..."
+    # This aligns shard_map keys with the key_base returned by _find_switch_mlp.
+    prefixes_to_try = ("language_model.model.", "language_model.")
+    normalized_map = {}
+    for key, path in shard_map.items():
+        normalized_key = key
+        for prefix in prefixes_to_try:
+            if normalized_key.startswith(prefix):
+                normalized_key = normalized_key[len(prefix) :]
+                break
+        # Add "model." prefix if key starts with "layers." (mlx-lm adds this)
+        if normalized_key.startswith("layers.") and not normalized_key.startswith(
+            "model."
+        ):
+            normalized_key = "model." + normalized_key
+        normalized_map[normalized_key] = path
+    shard_map = normalized_map
+
     # Detect per-expert format and add synthetic stacked keys.
     # Two naming conventions:
     #   Mixtral:  {prefix}.experts.0.w1.weight  (w1->gate, w2->down, w3->up)
@@ -82,7 +109,7 @@ def _build_shard_map(model_path: Path) -> dict[str, str]:
             continue
         idx = key.index(".experts.0.")
         moe_prefix = key[:idx]
-        remainder = key[idx + len(".experts.0."):]
+        remainder = key[idx + len(".experts.0.") :]
         parts = remainder.split(".")
         if len(parts) != 2:
             continue
@@ -103,9 +130,12 @@ _PROJ_TO_EXPERT_NAMES = {
 }
 
 
-def _load_proj_experts(shard: dict, key_prefix: str, expert_ids,
-                       shard_map: dict[str, str] | None = None,
-                       ) -> tuple[mx.array, mx.array, mx.array | None]:
+def _load_proj_experts(
+    shard: dict,
+    key_prefix: str,
+    expert_ids,
+    shard_map: dict[str, str] | None = None,
+) -> tuple[mx.array, mx.array, mx.array | None]:
     """Load weight/scales/biases for ``expert_ids`` from a safetensors shard.
 
     Handles both:
@@ -153,7 +183,11 @@ def _load_proj_experts(shard: dict, key_prefix: str, expert_ids,
 
     candidates = _PROJ_TO_EXPERT_NAMES.get(proj_name, (proj_name,))
 
-    ids = np.asarray(expert_ids).reshape(-1) if not isinstance(expert_ids, np.ndarray) else expert_ids.reshape(-1)
+    ids = (
+        np.asarray(expert_ids).reshape(-1)
+        if not isinstance(expert_ids, np.ndarray)
+        else expert_ids.reshape(-1)
+    )
 
     _extra_shards: dict[str, dict] = {}
 
@@ -250,18 +284,25 @@ class SafetensorsMap:
             for key, meta in header.items():
                 if key == "__metadata__":
                     continue
+                normalized_key = key
+                for prefix in ("language_model.model.", "language_model."):
+                    if normalized_key.startswith(prefix):
+                        normalized_key = normalized_key[len(prefix):]
+                        break
+                if normalized_key.startswith("layers.") and not normalized_key.startswith("model."):
+                    normalized_key = "model." + normalized_key
                 dtype_str = meta["dtype"]
                 shape = meta["shape"]
                 offsets = meta["data_offsets"]
                 np_dt, mx_dt = _ST_DTYPE_TO_NUMPY[dtype_str]
                 start = data_offset + offsets[0]
                 length = offsets[1] - offsets[0]
-                self._index[key] = (path, np_dt, mx_dt, shape, start, length)
+                self._index[normalized_key] = (path, np_dt, mx_dt, shape, start, length)
 
     def get_tensor(self, key: str) -> mx.array:
         path, np_dt, mx_dt, shape, start, length = self._index[key]
         mm = self._mmaps[path]
-        buf = mm[start:start + length]
+        buf = mm[start : start + length]
         arr_np = np.frombuffer(buf, dtype=np_dt).reshape(shape)
         result = mx.array(arr_np)
         if mx_dt == mx.bfloat16:
@@ -283,7 +324,7 @@ class SafetensorsMap:
         parts = []
         for eid in ids:
             row_start = start + int(eid) * row_bytes
-            buf = mm[row_start:row_start + row_bytes]
+            buf = mm[row_start : row_start + row_bytes]
             parts.append(np.frombuffer(buf, dtype=np_dt).reshape(row_shape))
 
         stacked = np.stack(parts)
@@ -306,7 +347,9 @@ class SafetensorsMap:
 
 
 def _mmap_load_proj_experts(
-    st_map: SafetensorsMap, key_prefix: str, expert_ids,
+    st_map: SafetensorsMap,
+    key_prefix: str,
+    expert_ids,
 ) -> tuple[mx.array, mx.array, mx.array | None]:
     """Load weight/scales/biases for ``expert_ids`` via mmap with byte-level slicing.
 
@@ -325,19 +368,25 @@ def _mmap_load_proj_experts(
     return w, s, b
 
 
-def _load_experts(key_prefix: str, expert_ids, shard=None,
-                   shard_map: dict[str, str] | None = None,
-                   st_map: SafetensorsMap | None = None,
-                   ) -> tuple[mx.array, mx.array, mx.array | None]:
+def _load_experts(
+    key_prefix: str,
+    expert_ids,
+    shard=None,
+    shard_map: dict[str, str] | None = None,
+    st_map: SafetensorsMap | None = None,
+) -> tuple[mx.array, mx.array, mx.array | None]:
     """Unified expert loading: mmap path for stacked format, mx.load fallback otherwise."""
     if st_map is not None and f"{key_prefix}.weight" in st_map:
         return _mmap_load_proj_experts(st_map, key_prefix, expert_ids)
     return _load_proj_experts(shard, key_prefix, expert_ids, shard_map=shard_map)
 
 
-def select_capacity(base_memory_gb: float, recommended_gb: float,
-                    num_moe_layers: int = 48,
-                    expert_slot_mb: float = 1.77) -> int:
+def select_capacity(
+    base_memory_gb: float,
+    recommended_gb: float,
+    num_moe_layers: int = 48,
+    expert_slot_mb: float = 1.77,
+) -> int:
     """Select expert cache capacity to stay under the Metal memory pressure cliff.
 
     Takes max_recommended_working_set_size from Metal (not total system RAM) and
@@ -365,6 +414,7 @@ def _with_cache_limit_zero(cache_bytes: int = 0):
     allows intermediate buffer reuse during forward passes while still
     reclaiming most cache memory.
     """
+
     @contextlib.contextmanager
     def _ctx():
         default_limit = mx.device_info()["memory_size"] // 4
@@ -437,7 +487,7 @@ def compute_adaptive_allocations(
     def _marginal_cost(layer_idx):
         cap = allocs[layer_idx]
         if cap <= min_per_layer:
-            return float('inf')
+            return float("inf")
         return _miss_rate(layer_idx, cap - 1) - _miss_rate(layer_idx, cap)
 
     def _marginal_utility(layer_idx):

@@ -27,10 +27,14 @@ import numpy as np
 from mlx_lm.utils import hf_repo_to_path
 from tool_chat_scenarios import get_profile_scenarios, render_scenario_prompt
 from mlx_moe.lazy_experts import (
-    enable_lazy_experts, upgrade_to_predictive, reset_to_cached,
+    enable_lazy_experts,
+    upgrade_to_predictive,
+    reset_to_cached,
     router_only_discovery,
-    _find_switch_mlp, _detect_num_experts,
-    CachedQuantizedSwitchLinear, PredictiveCachedSwitchLinear,
+    _find_switch_mlp,
+    _detect_num_experts,
+    CachedQuantizedSwitchLinear,
+    PredictiveCachedSwitchLinear,
 )
 
 MODEL_PRESETS = {
@@ -86,7 +90,7 @@ PROMPTS_CODING = [
     # Tool use / Agentic patterns (Claude Code scenario)
     'You have access to tools: [{"name": "read_file", "parameters": {"path": "string"}}]. Read the file at src/main.py and explain what it does.',
     'Based on the error "TypeError: Cannot read property map of undefined", fix the React component that fetches user data.',
-    'Generate a JSON schema for a REST API endpoint that creates a new user with name, email, and role fields.',
+    "Generate a JSON schema for a REST API endpoint that creates a new user with name, email, and role fields.",
     "Write a bash script that finds all Python files with syntax errors in a directory",
     # Code review / explanation
     "Explain what this code does: async def stream(): async for chunk in response.aiter_bytes(): yield chunk",
@@ -109,7 +113,9 @@ def apply_chat_template(tokenizer, text):
         try:
             return tokenizer.apply_chat_template(
                 [{"role": "user", "content": text}],
-                add_generation_prompt=True, tokenize=False)
+                add_generation_prompt=True,
+                tokenize=False,
+            )
         except Exception:
             pass
     return text
@@ -129,8 +135,9 @@ def collect_expert_activations(
     if discovery_mode == "router-only":
         router_only_discovery(model, tokenizer, prompt, max_tokens=WARMUP_TOKENS)
     else:
-        mlx_lm.generate(model, tokenizer, prompt=prompt,
-                        max_tokens=WARMUP_TOKENS, verbose=False)
+        mlx_lm.generate(
+            model, tokenizer, prompt=prompt, max_tokens=WARMUP_TOKENS, verbose=False
+        )
 
     # Harvest discovered experts from LCP caches before upgrade
     layer_experts = {}
@@ -230,27 +237,72 @@ def render_prompt_item(tokenizer, item, use_chat_template: bool) -> tuple[str, s
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Profile expert routing for universal expert identification")
-    parser.add_argument("--model", "-m", default="qwen",
-                        help="Model preset (qwen/mixtral/glm) or HuggingFace name")
-    parser.add_argument("--capacity", "-c", type=int, default=None,
-                        help="Expert capacity per layer (default: auto per model)")
-    parser.add_argument("--threshold", "-t", type=float, default=0.5,
-                        help="Fraction of prompts for 'universal' classification (default: 0.5)")
-    parser.add_argument("--output", "-o", default=None,
-                        help="Output JSON path (default: <model>_experts.json)")
-    parser.add_argument("--prompts", "-p", choices=list(PROMPT_PRESETS.keys()),
-                        default="diverse", help="Prompt preset (default: diverse)")
-    parser.add_argument("--coding-weight", type=int, default=70,
-                        help="Coding prompt weight for --prompts mixed (default: 70)")
-    parser.add_argument("--toolchat-weight", type=int, default=30,
-                        help="Tool-chat prompt weight for --prompts mixed (default: 30)")
-    parser.add_argument("--num-prompts", type=int, default=24,
-                        help="Total sampled prompts for --prompts mixed (default: 24)")
-    parser.add_argument("--seed", type=int, default=0,
-                        help="Sampling seed for --prompts mixed (default: 0)")
-    parser.add_argument("--discovery", choices=["warmup", "router-only"], default=None,
-                        help="Discovery method (default: warmup, auto router-only for tool-chat/mixed)")
+    parser = argparse.ArgumentParser(
+        description="Profile expert routing for universal expert identification"
+    )
+    parser.add_argument(
+        "--model",
+        "-m",
+        default="qwen",
+        help="Model preset (qwen/mixtral/glm) or HuggingFace name",
+    )
+    parser.add_argument(
+        "--capacity",
+        "-c",
+        type=int,
+        default=None,
+        help="Expert capacity per layer (default: auto per model)",
+    )
+    parser.add_argument(
+        "--threshold",
+        "-t",
+        type=float,
+        default=0.5,
+        help="Fraction of prompts for 'universal' classification (default: 0.5)",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        default=None,
+        help="Output JSON path (default: <model>_experts.json)",
+    )
+    parser.add_argument(
+        "--prompts",
+        "-p",
+        choices=list(PROMPT_PRESETS.keys()),
+        default="diverse",
+        help="Prompt preset (default: diverse)",
+    )
+    parser.add_argument(
+        "--coding-weight",
+        type=int,
+        default=70,
+        help="Coding prompt weight for --prompts mixed (default: 70)",
+    )
+    parser.add_argument(
+        "--toolchat-weight",
+        type=int,
+        default=30,
+        help="Tool-chat prompt weight for --prompts mixed (default: 30)",
+    )
+    parser.add_argument(
+        "--num-prompts",
+        type=int,
+        default=24,
+        help="Total sampled prompts for --prompts mixed (default: 24)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Sampling seed for --prompts mixed (default: 0)",
+    )
+    parser.add_argument(
+        "--discovery",
+        choices=["warmup", "router-only"],
+        default=None,
+        help="Discovery method (default: warmup, auto router-only for tool-chat/mixed)",
+    )
     args = parser.parse_args()
 
     if args.model in MODEL_PRESETS:
@@ -263,7 +315,10 @@ def main():
 
     capacity = args.capacity if args.capacity is not None else default_capacity
     output_path = args.output or f"{short_name}_experts.json"
-    use_chat_template = args.model in ("mixtral", "glm", "qwen2-moe", "qwen3-30b") or "instruct" in model_name.lower()
+    use_chat_template = (
+        args.model in ("mixtral", "glm", "qwen2-moe", "qwen3-30b")
+        or "instruct" in model_name.lower()
+    )
     prompt_items = resolve_prompt_items(
         args.prompts,
         coding_weight=args.coding_weight,
@@ -275,7 +330,10 @@ def main():
         "router-only" if args.prompts in ("tool-chat", "mixed") else "warmup"
     )
 
-    model_path = hf_repo_to_path(model_name)
+    if Path(model_name).is_absolute() or model_name.startswith(("./", "~")):
+        model_path = Path(model_name)
+    else:
+        model_path = hf_repo_to_path(model_name)
     print(f"Model: {model_name}")
     print(f"Model path: {model_path}")
     print(f"Capacity: {capacity}, Threshold: {args.threshold}")
@@ -302,9 +360,9 @@ def main():
             num_experts = _detect_num_experts(switch)
     print(f"MoE layers: {moe_layers}, Experts per layer: {num_experts}")
 
-    replaced = enable_lazy_experts(model, model_path,
-                                   cache_capacity_per_layer=capacity,
-                                   predictive=True)
+    replaced = enable_lazy_experts(
+        model, model_path, cache_capacity_per_layer=capacity, predictive=True
+    )
     print(f"Replaced {replaced} modules")
 
     mx.eval(model.parameters())
@@ -312,12 +370,21 @@ def main():
 
     # Bootstrap: first warmup + upgrade so reset_to_cached works in the loop
     print(f"\nBootstrap warmup...")
-    _, bootstrap_prompt = render_prompt_item(tokenizer, prompt_items[0], use_chat_template)
+    _, bootstrap_prompt = render_prompt_item(
+        tokenizer, prompt_items[0], use_chat_template
+    )
     if discovery_mode == "router-only":
-        router_only_discovery(model, tokenizer, bootstrap_prompt, max_tokens=WARMUP_TOKENS)
+        router_only_discovery(
+            model, tokenizer, bootstrap_prompt, max_tokens=WARMUP_TOKENS
+        )
     else:
-        mlx_lm.generate(model, tokenizer, prompt=bootstrap_prompt,
-                        max_tokens=WARMUP_TOKENS, verbose=False)
+        mlx_lm.generate(
+            model,
+            tokenizer,
+            prompt=bootstrap_prompt,
+            max_tokens=WARMUP_TOKENS,
+            verbose=False,
+        )
     upgrade_to_predictive(model, model_path, capacity)
     print(f"Metal memory: {mx.get_active_memory() / 1e9:.1f} GB")
 
@@ -329,7 +396,13 @@ def main():
         prompt_name, prompt = render_prompt_item(tokenizer, item, use_chat_template)
         t0 = time.perf_counter()
         layer_experts = collect_expert_activations(
-            model, tokenizer, model_path, prompt, capacity, discovery_mode=discovery_mode)
+            model,
+            tokenizer,
+            model_path,
+            prompt,
+            capacity,
+            discovery_mode=discovery_mode,
+        )
         elapsed = time.perf_counter() - t0
 
         for layer_idx, experts in layer_experts.items():
@@ -337,9 +410,11 @@ def main():
                 activation_counts[layer_idx][eid] += 1
 
         n_experts = sum(len(e) for e in layer_experts.values())
-        print(f"  [{p_idx + 1}/{num_prompts}] {elapsed:.1f}s, "
-              f"{len(layer_experts)} layers, {n_experts} total activations: "
-              f"{prompt_name[:60]}...")
+        print(
+            f"  [{p_idx + 1}/{num_prompts}] {elapsed:.1f}s, "
+            f"{len(layer_experts)} layers, {n_experts} total activations: "
+            f"{prompt_name[:60]}..."
+        )
 
     print(f"\nTotal profiling time: {time.perf_counter() - t_total:.0f}s")
 
@@ -356,7 +431,9 @@ def main():
             "toolchat_weight": args.toolchat_weight,
             "num_prompts": args.num_prompts,
             "seed": args.seed,
-        } if args.prompts == "mixed" else None,
+        }
+        if args.prompts == "mixed"
+        else None,
         "layers": {},
     }
 
@@ -383,15 +460,21 @@ def main():
     print(f"\n--- Summary ---")
     print(f"Model: {model_name}")
     print(f"Prompts profiled: {num_prompts}")
-    print(f"Threshold: {args.threshold} ({int(args.threshold * num_prompts)}/{num_prompts} prompts)")
+    print(
+        f"Threshold: {args.threshold} ({int(args.threshold * num_prompts)}/{num_prompts} prompts)"
+    )
     print(f"MoE layers: {len(layers)}, Experts per layer: {num_experts}")
-    print(f"Capacity: {capacity}/{num_experts} ({capacity/num_experts*100:.0f}%)")
-    print(f"Universal experts per layer: "
-          f"min={min(universal_per_layer)} median={sorted(universal_per_layer)[len(universal_per_layer)//2]} "
-          f"max={max(universal_per_layer)} total={total_universal}")
-    print(f"Unique experts per layer: "
-          f"min={min(unique_per_layer)} median={sorted(unique_per_layer)[len(unique_per_layer)//2]} "
-          f"max={max(unique_per_layer)}")
+    print(f"Capacity: {capacity}/{num_experts} ({capacity / num_experts * 100:.0f}%)")
+    print(
+        f"Universal experts per layer: "
+        f"min={min(universal_per_layer)} median={sorted(universal_per_layer)[len(universal_per_layer) // 2]} "
+        f"max={max(universal_per_layer)} total={total_universal}"
+    )
+    print(
+        f"Unique experts per layer: "
+        f"min={min(unique_per_layer)} median={sorted(unique_per_layer)[len(unique_per_layer) // 2]} "
+        f"max={max(unique_per_layer)}"
+    )
 
 
 if __name__ == "__main__":

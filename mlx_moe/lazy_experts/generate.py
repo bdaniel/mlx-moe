@@ -57,7 +57,10 @@ def _startup(
 
     t_total_start = time.perf_counter()
 
-    model_path = hf_repo_to_path(model_name)
+    if Path(model_name).is_absolute() or model_name.startswith(("./", "~")):
+        model_path = Path(model_name).expanduser()
+    else:
+        model_path = hf_repo_to_path(model_name)
     t0 = time.perf_counter()
     model, tokenizer = _mlx_lm.load(model_name, lazy=True)
 
@@ -72,7 +75,9 @@ def _startup(
             if num_experts == 0:
                 num_experts = _detect_num_experts(switch)
             if expert_slot_mb == 0.0:
-                proj = getattr(switch, "gate_proj", None) or getattr(switch, "up_proj", None)
+                proj = getattr(switch, "gate_proj", None) or getattr(
+                    switch, "up_proj", None
+                )
                 if proj is not None and hasattr(proj, "weight"):
                     per_expert = proj.weight.nbytes // num_experts
                     for attr in ("scales", "biases"):
@@ -85,15 +90,18 @@ def _startup(
     gc_limit_gb = recommended_gb * 0.95
 
     if capacity is None:
-        enable_lazy_experts(model, model_path,
-                            cache_capacity_per_layer=0,
-                            predictive=True)
+        enable_lazy_experts(
+            model, model_path, cache_capacity_per_layer=0, predictive=True
+        )
         mx.eval(model.parameters())
         base_gb = mx.get_active_memory() / 1e9
 
-        capacity = select_capacity(base_gb, recommended_gb,
-                                   num_moe_layers=num_moe_layers,
-                                   expert_slot_mb=expert_slot_mb)
+        capacity = select_capacity(
+            base_gb,
+            recommended_gb,
+            num_moe_layers=num_moe_layers,
+            expert_slot_mb=expert_slot_mb,
+        )
 
     if num_experts > 0:
         capacity = min(capacity, num_experts)
@@ -102,9 +110,9 @@ def _startup(
     # predictive mode avoids the mx.eval() calls inside the forward pass that break
     # async_eval pipelining and cause OOM with large experts (~170 MB for Mixtral 22B).
     # Fallbacks map to slot 0; between-token swapping corrects misses progressively.
-    enable_lazy_experts(model, model_path,
-                        cache_capacity_per_layer=capacity,
-                        predictive=True)
+    enable_lazy_experts(
+        model, model_path, cache_capacity_per_layer=capacity, predictive=True
+    )
     mx.eval(model.parameters())
 
     shard_map = _build_shard_map(model_path)
@@ -112,8 +120,10 @@ def _startup(
     model._st_map = SafetensorsMap(all_shards)
 
     t_load = time.perf_counter() - t0
-    print(f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB) "
-          f"[{num_experts} experts, cap={capacity}]")
+    print(
+        f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB) "
+        f"[{num_experts} experts, cap={capacity}]"
+    )
 
     cache_path = None
     prepacked_path = None
@@ -139,8 +149,9 @@ def _startup(
             if saved_prompt and saved_prompt != prompt:
                 t0 = time.perf_counter()
                 with _with_cache_limit_zero(_WARMUP_CACHE):
-                    fast_delta_warmup(model, tokenizer, model_path, prompt,
-                                      discovery_tokens=10)
+                    fast_delta_warmup(
+                        model, tokenizer, model_path, prompt, discovery_tokens=10
+                    )
                 print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
         used_saved_state = True
 
@@ -155,19 +166,20 @@ def _startup(
         if saved_prompt and saved_prompt != prompt:
             t0 = time.perf_counter()
             with _with_cache_limit_zero(_WARMUP_CACHE):
-                fast_delta_warmup(model, tokenizer, model_path, prompt,
-                                  discovery_tokens=10)
+                fast_delta_warmup(
+                    model, tokenizer, model_path, prompt, discovery_tokens=10
+                )
             print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
         used_saved_state = True
 
     else:
         if warmup == "full":
             t0 = time.perf_counter()
-            _mlx_lm.generate(model, tokenizer, prompt=prompt,
-                             max_tokens=50, verbose=False)
+            _mlx_lm.generate(
+                model, tokenizer, prompt=prompt, max_tokens=50, verbose=False
+            )
             with _with_cache_limit_zero(_WARMUP_CACHE):
-                upgrade_to_predictive(model, model_path, capacity,
-                                      st_map=model._st_map)
+                upgrade_to_predictive(model, model_path, capacity, st_map=model._st_map)
             print(f"  Full LCP warmup + upgrade: {time.perf_counter() - t0:.1f}s")
         elif profile_path is not None:
             t0 = time.perf_counter()
@@ -186,25 +198,32 @@ def _startup(
 
         if warmup == "hybrid" and not used_saved_state:
             from .core import dynamic_cache_update, enable_skip_fallback
+
             enable_skip_fallback(model)
             t0 = time.perf_counter()
-            for resp in _mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
-                                                 max_tokens=10):
+            for resp in _mlx_lm.stream_generate(
+                model, tokenizer, prompt=prompt, max_tokens=10
+            ):
                 dynamic_cache_update(model, max_layer_updates=48)
             swaps = sum(
                 s.get("swaps", 0)
                 for s in dynamic_cache_update(model, max_layer_updates=48)
             )
-            print(f"  Hybrid warmup: {time.perf_counter() - t0:.1f}s ({swaps} expert swaps)")
+            print(
+                f"  Hybrid warmup: {time.perf_counter() - t0:.1f}s ({swaps} expert swaps)"
+            )
 
     peak_gb = mx.get_peak_memory() / 1e9
     if peak_gb > gc_limit_gb:
-        print(f"  WARNING: upgrade peak {peak_gb:.1f} GB exceeded gc_limit {gc_limit_gb:.1f} GB")
+        print(
+            f"  WARNING: upgrade peak {peak_gb:.1f} GB exceeded gc_limit {gc_limit_gb:.1f} GB"
+        )
         print(f"  Generation may be slow. Try --capacity {max(8, capacity - 8)}")
 
     if cache_path and not used_saved_state:
-        save_cache_state(model, cache_path,
-                         metadata={"prompt": prompt, "capacity": capacity})
+        save_cache_state(
+            model, cache_path, metadata={"prompt": prompt, "capacity": capacity}
+        )
 
     if prepacked and prepacked_path and not os.path.exists(prepacked_path):
         t0 = time.perf_counter()
@@ -212,6 +231,7 @@ def _startup(
         print(f"  Save prepacked: {time.perf_counter() - t0:.1f}s")
 
     from .core import enable_skip_fallback
+
     if warmup != "hybrid" or used_saved_state:
         enable_skip_fallback(model)
 
@@ -228,14 +248,18 @@ def _startup(
     return model, tokenizer, model_path
 
 
-def generate(model_name: str, prompt: str, max_tokens: int = 200,
-                   cache_dir: str | None = None,
-                   profile_path: str | None = None,
-                   prepacked: bool = True,
-                   capacity: int | None = None,
-                   kv_bits: int | None = None,
-                   warmup: str = "hybrid",
-                   pin_top_k: int | None = None) -> str:
+def generate(
+    model_name: str,
+    prompt: str,
+    max_tokens: int = 200,
+    cache_dir: str | None = None,
+    profile_path: str | None = None,
+    prepacked: bool = True,
+    capacity: int | None = None,
+    kv_bits: int | None = None,
+    warmup: str = "hybrid",
+    pin_top_k: int | None = None,
+) -> str:
     """One-call generation with all optimizations.
 
     Args:
@@ -257,26 +281,42 @@ def generate(model_name: str, prompt: str, max_tokens: int = 200,
     import mlx_lm as _mlx_lm
 
     model, tokenizer, _ = _startup(
-        model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked, capacity=capacity,
-        warmup=warmup, pin_top_k=pin_top_k)
+        model_name,
+        prompt,
+        cache_dir=cache_dir,
+        profile_path=profile_path,
+        prepacked=prepacked,
+        capacity=capacity,
+        warmup=warmup,
+        pin_top_k=pin_top_k,
+    )
 
     kv_kwargs = {}
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
 
-    return _mlx_lm.generate(model, tokenizer, prompt=prompt,
-                             max_tokens=max_tokens, verbose=False, **kv_kwargs)
+    return _mlx_lm.generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=max_tokens,
+        verbose=False,
+        **kv_kwargs,
+    )
 
 
-def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
-                          cache_dir: str | None = None,
-                          profile_path: str | None = None,
-                          prepacked: bool = True,
-                          capacity: int | None = None,
-                          kv_bits: int | None = None,
-                          warmup: str = "hybrid",
-                          pin_top_k: int | None = None):
+def stream_generate(
+    model_name: str,
+    prompt: str,
+    max_tokens: int = 200,
+    cache_dir: str | None = None,
+    profile_path: str | None = None,
+    prepacked: bool = True,
+    capacity: int | None = None,
+    kv_bits: int | None = None,
+    warmup: str = "hybrid",
+    pin_top_k: int | None = None,
+):
     """Streaming variant of generate.
 
     Startup is blocking. After startup, yields GenerationResponse objects
@@ -288,16 +328,23 @@ def stream_generate(model_name: str, prompt: str, max_tokens: int = 200,
     import mlx_lm as _mlx_lm
 
     model, tokenizer, _ = _startup(
-        model_name, prompt, cache_dir=cache_dir,
-        profile_path=profile_path, prepacked=prepacked, capacity=capacity,
-        warmup=warmup, pin_top_k=pin_top_k)
+        model_name,
+        prompt,
+        cache_dir=cache_dir,
+        profile_path=profile_path,
+        prepacked=prepacked,
+        capacity=capacity,
+        warmup=warmup,
+        pin_top_k=pin_top_k,
+    )
 
     kv_kwargs = {}
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
 
-    yield from _mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
-                                        max_tokens=max_tokens, **kv_kwargs)
+    yield from _mlx_lm.stream_generate(
+        model, tokenizer, prompt=prompt, max_tokens=max_tokens, **kv_kwargs
+    )
 
 
 class Session:
@@ -315,10 +362,16 @@ class Session:
         session.close()
     """
 
-    def __init__(self, model_name: str, cache_dir: str | None = None,
-                 profile_path: str | None = None, prepacked: bool = True,
-                 capacity: int | None = None, kv_bits: int | None = None,
-                 pin_top_k: int | None = None):
+    def __init__(
+        self,
+        model_name: str,
+        cache_dir: str | None = None,
+        profile_path: str | None = None,
+        prepacked: bool = True,
+        capacity: int | None = None,
+        kv_bits: int | None = None,
+        pin_top_k: int | None = None,
+    ):
         self._model_name = model_name
         self._cache_dir = cache_dir
         self._profile_path = profile_path
@@ -334,15 +387,25 @@ class Session:
     def _ensure_loaded(self, prompt: str):
         if self._model is None:
             self._model, self._tokenizer, self._model_path = _startup(
-                self._model_name, prompt, cache_dir=self._cache_dir,
-                profile_path=self._profile_path, prepacked=self._prepacked,
-                capacity=self._capacity, pin_top_k=self._pin_top_k)
+                self._model_name,
+                prompt,
+                cache_dir=self._cache_dir,
+                profile_path=self._profile_path,
+                prepacked=self._prepacked,
+                capacity=self._capacity,
+                pin_top_k=self._pin_top_k,
+            )
             self._last_prompt = prompt
         elif self._last_prompt != prompt:
             t0 = time.perf_counter()
             with _with_cache_limit_zero(_WARMUP_CACHE):
-                fast_delta_warmup(self._model, self._tokenizer,
-                                  self._model_path, prompt, discovery_tokens=10)
+                fast_delta_warmup(
+                    self._model,
+                    self._tokenizer,
+                    self._model_path,
+                    prompt,
+                    discovery_tokens=10,
+                )
             print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
             self._last_prompt = prompt
 
@@ -356,18 +419,27 @@ class Session:
         import mlx_lm as _mlx_lm
 
         self._ensure_loaded(prompt)
-        yield from _mlx_lm.stream_generate(self._model, self._tokenizer,
-                                            prompt=prompt, max_tokens=max_tokens,
-                                            **self._kv_kwargs())
+        yield from _mlx_lm.stream_generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            **self._kv_kwargs(),
+        )
 
     def generate(self, prompt: str, max_tokens: int = 200) -> str:
         """Non-streaming generation for a single turn."""
         import mlx_lm as _mlx_lm
 
         self._ensure_loaded(prompt)
-        return _mlx_lm.generate(self._model, self._tokenizer,
-                                 prompt=prompt, max_tokens=max_tokens, verbose=False,
-                                 **self._kv_kwargs())
+        return _mlx_lm.generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            verbose=False,
+            **self._kv_kwargs(),
+        )
 
     @property
     def memory_gb(self) -> float:
