@@ -1,7 +1,10 @@
 # Copyright © 2023-2025 Apple Inc.
 
 import os
+import json
+import logging
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import mlx.core as mx
@@ -31,9 +34,54 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
+@contextmanager
+def _suppress_transformers_config_warnings():
+    logger_names = ("transformers", "transformers.configuration_utils")
+    old_levels = {name: logging.getLogger(name).level for name in logger_names}
+    for name in logger_names:
+        logging.getLogger(name).setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        for name, level in old_levels.items():
+            logging.getLogger(name).setLevel(level)
+
+
+def _model_path_for_name(model_name: str) -> Path | None:
+    if Path(model_name).is_absolute() or model_name.startswith(("./", "~")):
+        return Path(model_name).expanduser()
+
+    try:
+        from mlx_lm.utils import hf_repo_to_path
+        return hf_repo_to_path(model_name)
+    except Exception:
+        return None
+
+
+def _requires_strict_false_load(model_path: Path | None) -> bool:
+    if model_path is None:
+        return False
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
+        return False
+
+    config = json.loads(config_path.read_text())
+    return config.get("model_type") == "qwen3_5_moe" and "vision_config" in config
+
+
 def _load_model_and_tokenizer(model_name: str, lazy: bool = True):
     import mlx_lm as _mlx_lm
     from mlx_lm.utils import _download, hf_repo_to_path, load_model, load_tokenizer
+
+    model_path = _model_path_for_name(model_name)
+    if _requires_strict_false_load(model_path):
+        model, config = load_model(model_path, lazy=lazy, strict=False)
+        with _suppress_transformers_config_warnings():
+            tokenizer = load_tokenizer(
+                model_path,
+                eos_token_ids=config.get("eos_token_id", None),
+            )
+        return model, tokenizer, model_path
 
     try:
         model, tokenizer = _mlx_lm.load(model_name, lazy=lazy)
