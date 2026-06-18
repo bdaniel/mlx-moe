@@ -34,6 +34,76 @@ from .persistence import (
 _WARMUP_CACHE = 256 * 1024 * 1024
 
 
+def _dynamic_update_policy(
+    generation_tokens: int,
+    last_fallback_rate: float,
+    no_swap_streak: int,
+    low_fallback_streak: int,
+) -> tuple[int, int]:
+    if last_fallback_rate >= 0.35:
+        interval, budget = 1, 48
+    elif last_fallback_rate >= 0.20:
+        interval, budget = 1, 32
+    elif last_fallback_rate >= 0.10:
+        interval, budget = 2, 24
+    elif generation_tokens <= 32:
+        interval, budget = 2, 24
+    elif generation_tokens <= 96:
+        interval, budget = 3, 16
+    else:
+        interval, budget = 4, 12
+
+    if no_swap_streak >= 4 and last_fallback_rate < 0.15:
+        interval *= 2
+        budget = max(8, budget // 2)
+
+    if low_fallback_streak >= 6 and last_fallback_rate < 0.08:
+        interval = max(interval, 12)
+        budget = 8
+
+    if low_fallback_streak >= 12 and last_fallback_rate < 0.05:
+        interval = max(interval, 20)
+        budget = 8
+
+    return interval, budget
+
+
+def _stream_with_dynamic_updates(model, responses):
+    from .core import dynamic_cache_update
+
+    no_swap_streak = 0
+    low_fallback_streak = 0
+    last_fallback_rate = 1.0
+
+    for resp in responses:
+        yield resp
+        interval, budget = _dynamic_update_policy(
+            resp.generation_tokens,
+            last_fallback_rate,
+            no_swap_streak,
+            low_fallback_streak,
+        )
+        if resp.generation_tokens % interval != 0:
+            continue
+
+        stats = dynamic_cache_update(model, max_layer_updates=budget)
+        swaps = sum(s.get("swaps", 0) for s in stats)
+        fallbacks = sum(s.get("fallbacks", 0) for s in stats)
+        requests = sum(s.get("requests", 0) for s in stats)
+
+        if requests > 0:
+            last_fallback_rate = fallbacks / requests
+            if last_fallback_rate <= 0.005:
+                low_fallback_streak += 1
+            else:
+                low_fallback_streak = 0
+
+        if swaps == 0:
+            no_swap_streak += 1
+        else:
+            no_swap_streak = 0
+
+
 @contextmanager
 def _suppress_transformers_config_warnings():
     logger_names = ("transformers", "transformers.configuration_utils")
@@ -360,14 +430,19 @@ def generate(
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
 
-    return _mlx_lm.generate(
+    text = ""
+    for resp in _stream_with_dynamic_updates(
         model,
-        tokenizer,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        verbose=False,
-        **kv_kwargs,
-    )
+        _mlx_lm.stream_generate(
+            model,
+            tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+            **kv_kwargs,
+        ),
+    ):
+        text += resp.text
+    return text
 
 
 def stream_generate(
@@ -407,8 +482,11 @@ def stream_generate(
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
 
-    yield from _mlx_lm.stream_generate(
-        model, tokenizer, prompt=prompt, max_tokens=max_tokens, **kv_kwargs
+    yield from _stream_with_dynamic_updates(
+        model,
+        _mlx_lm.stream_generate(
+            model, tokenizer, prompt=prompt, max_tokens=max_tokens, **kv_kwargs
+        ),
     )
 
 
@@ -484,12 +562,15 @@ class Session:
         import mlx_lm as _mlx_lm
 
         self._ensure_loaded(prompt)
-        yield from _mlx_lm.stream_generate(
+        yield from _stream_with_dynamic_updates(
             self._model,
-            self._tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            **self._kv_kwargs(),
+            _mlx_lm.stream_generate(
+                self._model,
+                self._tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                **self._kv_kwargs(),
+            ),
         )
 
     def generate(self, prompt: str, max_tokens: int = 200) -> str:
@@ -497,14 +578,10 @@ class Session:
         import mlx_lm as _mlx_lm
 
         self._ensure_loaded(prompt)
-        return _mlx_lm.generate(
-            self._model,
-            self._tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            verbose=False,
-            **self._kv_kwargs(),
-        )
+        text = ""
+        for resp in self.stream(prompt, max_tokens=max_tokens):
+            text += resp.text
+        return text
 
     @property
     def memory_gb(self) -> float:
