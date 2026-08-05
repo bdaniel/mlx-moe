@@ -69,8 +69,8 @@ def run_baseline(model_name, max_tokens=200):
 
 def run_mlx_moe(model_name, capacity=None, max_tokens=200):
     """Run mlx-moe generation with diagnostics."""
-    from mlx_moe.lazy_experts.generate import _startup
-    from mlx_moe.lazy_experts.core import get_fallback_stats, measure_fallback
+    from mlx_moe.lazy_experts.generate import _startup, _stream_with_dynamic_updates
+    from mlx_moe.lazy_experts.core import dynamic_cache_update, get_fallback_stats
     from mlx_moe.lazy_experts.loading import _find_switch_mlp, _detect_num_experts
     import mlx_lm
 
@@ -103,9 +103,12 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
     for i, prompt_text in enumerate(TEST_PROMPTS):
         if hasattr(tokenizer, "apply_chat_template"):
             try:
+                kwargs = {"add_generation_prompt": True, "tokenize": False}
+                if getattr(tokenizer, "has_thinking", False):
+                    kwargs["enable_thinking"] = False
                 prompt = tokenizer.apply_chat_template(
                     [{"role": "user", "content": prompt_text}],
-                    add_generation_prompt=True, tokenize=False)
+                    **kwargs)
             except Exception:
                 prompt = prompt_text
         else:
@@ -113,24 +116,34 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
 
         print(f"\n--- Prompt {i+1}: {prompt_text[:50]}... ---")
 
+        fb_before = get_fallback_stats(model)
         t0 = time.perf_counter()
         tokens = 0
-        tps = 0.0
         text = ""
-        for resp in mlx_lm.stream_generate(model, tokenizer, prompt=prompt,
-                                             max_tokens=max_tokens):
+        responses = mlx_lm.stream_generate(
+            model, tokenizer, prompt=prompt, max_tokens=max_tokens
+        )
+        for resp in _stream_with_dynamic_updates(model, responses):
             text += resp.text
             tokens = resp.generation_tokens
-            tps = resp.generation_tps
+
+        for _ in range(4):
+            stats = dynamic_cache_update(model, max_layer_updates=32)
+            if not any(s.get("swaps", 0) or s.get("requests", 0) for s in stats):
+                break
 
         gen_time = time.perf_counter() - t0
+        tps = tokens / gen_time if gen_time > 0 else 0.0
         mem_after = mx.get_active_memory() / 1e9
 
-        fb = measure_fallback(model)
+        fb_after = get_fallback_stats(model)
+        fb_requests = fb_after["total_requests"] - fb_before["total_requests"]
+        fb_fallbacks = fb_after["total_fallbacks"] - fb_before["total_fallbacks"]
+        fallback_rate = fb_fallbacks / fb_requests if fb_requests else 0.0
 
         print(f"  {tokens} tokens, {tps:.1f} tok/s, {gen_time:.1f}s")
         print(f"  Memory: {mem_after:.1f} GB")
-        print(f"  Fallback: {fb['fallback_rate']*100:.1f}% ({fb['total_fallbacks']}/{fb['total_requests']})")
+        print(f"  Fallback: {fallback_rate*100:.1f}% ({fb_fallbacks}/{fb_requests})")
         print(f"  Output: {text[:150]}...")
 
         results.append({
@@ -139,7 +152,7 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
             "tps": tps,
             "gen_time": gen_time,
             "memory_gb": mem_after,
-            "fallback_rate": fb["fallback_rate"],
+            "fallback_rate": fallback_rate,
         })
 
     # Cleanup
