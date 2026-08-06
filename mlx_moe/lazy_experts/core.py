@@ -647,6 +647,61 @@ def dynamic_cache_update(model, max_layer_updates: int = 12) -> list[dict]:
     return stats
 
 
+def adaptive_cache_growth(
+    model,
+    fallback_rate: float,
+    *,
+    min_fallback_rate: float = 0.25,
+    min_headroom_gb: float = 1.0,
+    grow_by: int = 8,
+    max_layer_growths: int = 16,
+) -> dict:
+    """Append cache slots for recently missed experts when memory allows."""
+    if fallback_rate < min_fallback_rate:
+        return {"grown": 0, "layers": 0, "headroom_gb": None}
+
+    info = mx.device_info()
+    recommended_gb = info["max_recommended_working_set_size"] / 1e9
+    active_gb = mx.get_active_memory() / 1e9
+    headroom_gb = recommended_gb - active_gb
+    if headroom_gb < min_headroom_gb:
+        return {"grown": 0, "layers": 0, "headroom_gb": headroom_gb}
+
+    candidates = []
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(
+            proj, (PredictiveCachedSwitchLinear, SyncPredictiveCachedSwitchLinear)
+        ):
+            continue
+        cache = proj._cache
+        misses = [
+            eid
+            for eid in cache.last_misses
+            if eid not in cache.cached_set and len(cache.cached_ids) < cache.num_experts
+        ]
+        if not misses:
+            continue
+        misses.sort(
+            key=lambda eid: (cache.frequency.get(eid, 0), cache.last_active.get(eid, 0)),
+            reverse=True,
+        )
+        candidates.append((len(misses), i, cache, misses[:grow_by]))
+
+    grown = 0
+    layers = 0
+    for _, _, cache, expert_ids in sorted(candidates, reverse=True)[:max_layer_growths]:
+        added = cache.grow(expert_ids)
+        if added:
+            grown += added
+            layers += 1
+
+    return {"grown": grown, "layers": layers, "headroom_gb": headroom_gb}
+
+
 def dynamic_cache_update_ml(
     model,
     eviction_models: dict,

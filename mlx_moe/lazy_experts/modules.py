@@ -96,6 +96,7 @@ class LazyQuantizedSwitchLinear(nn.Module):
         self._shard_path = shard_path
         self._key_prefix = key_prefix
         self._shard_map = shard_map
+        self._st_map = None
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
@@ -147,6 +148,7 @@ class CachedQuantizedSwitchLinear(nn.Module):
         self._shard_path = shard_path
         self._key_prefix = key_prefix
         self._shard_map = shard_map
+        self._st_map = None
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
@@ -174,9 +176,18 @@ class CachedQuantizedSwitchLinear(nn.Module):
 
         if miss_ids:
             miss_arr = mx.array(miss_ids)
-            shard = mx.load(self._shard_path)
-            w_batch, s_batch, b_batch = _load_proj_experts(shard, self._key_prefix, miss_arr,
-                                                            shard_map=self._shard_map)
+            use_mmap = (
+                self._st_map is not None
+                and f"{self._key_prefix}.weight" in self._st_map
+            )
+            shard = None if use_mmap else mx.load(self._shard_path)
+            w_batch, s_batch, b_batch = _load_experts(
+                self._key_prefix,
+                miss_arr,
+                shard=shard,
+                shard_map=self._shard_map,
+                st_map=self._st_map,
+            )
             mx.eval(w_batch, s_batch) if b_batch is None else mx.eval(w_batch, s_batch, b_batch)
 
             for i, eid in enumerate(miss_ids):
@@ -243,7 +254,7 @@ class PredictiveExpertCache:
                  '_shard_paths', '_key_prefixes', '_shard_map',
                  '_st_map',
                  'total_requests', 'total_fallbacks',
-                 'pinned_set')
+                 'pinned_set', 'last_misses')
 
     def __init__(self, capacity: int, num_experts: int = 512):
         self.capacity = capacity
@@ -266,6 +277,7 @@ class PredictiveExpertCache:
         self.total_requests: int = 0
         self.total_fallbacks: int = 0
         self.pinned_set: set[int] = set()
+        self.last_misses: set[int] = set()
 
     def build_lookup(self, cached_ids: list[int]) -> None:
         """Build GPU-resident lookup table and hit mask from cached expert IDs.
@@ -326,6 +338,7 @@ class PredictiveExpertCache:
             self.last_active[eid] = self.step
 
         misses = all_requested - self.cached_set
+        self.last_misses = set(misses)
         n_requests = len(all_requested)
         n_fallbacks = len(misses)
         self.total_requests += n_requests
@@ -399,6 +412,54 @@ class PredictiveExpertCache:
         mx.eval(self.lookup, self.hit_mask)
 
         return {"swaps": len(swaps), "fallbacks": n_fallbacks, "requests": n_requests}
+
+    def grow(self, expert_ids: list[int]) -> int:
+        """Append new expert slots without evicting existing cached experts."""
+        new_ids = [eid for eid in expert_ids if eid not in self.cached_set]
+        room = self.num_experts - len(self.cached_ids)
+        if room <= 0:
+            return 0
+        new_ids = new_ids[:room]
+        if not new_ids or not self._shard_paths:
+            return 0
+
+        new_eids = mx.array(new_ids)
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            shard_path = self._shard_paths[proj_name]
+            key_prefix = self._key_prefixes[proj_name]
+            shard = mx.load(shard_path) if self._st_map is None else None
+            new_w, new_s, new_b = _load_experts(
+                key_prefix,
+                new_eids,
+                shard=shard,
+                shard_map=self._shard_map,
+                st_map=self._st_map,
+            )
+            del shard
+
+            if new_b is None:
+                mx.eval(new_w, new_s)
+            else:
+                mx.eval(new_w, new_s, new_b)
+
+            self.weights[proj_name] = mx.concatenate(
+                [self.weights[proj_name], new_w], axis=0
+            )
+            self.scales[proj_name] = mx.concatenate(
+                [self.scales[proj_name], new_s], axis=0
+            )
+            if self.biases[proj_name] is not None and new_b is not None:
+                self.biases[proj_name] = mx.concatenate(
+                    [self.biases[proj_name], new_b], axis=0
+                )
+
+        self.cached_ids.extend(new_ids)
+        self.cached_set.update(new_ids)
+        self.capacity = len(self.cached_ids)
+        self.rebuild_lookup()
+        mx.eval(self.lookup, self.hit_mask)
+        mx.clear_cache()
+        return len(new_ids)
 
 
 class PredictiveCachedSwitchLinear(nn.Module):
@@ -476,5 +537,3 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             bits=self.bits,
             mode=self.mode,
         )
-
-

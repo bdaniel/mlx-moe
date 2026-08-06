@@ -331,6 +331,26 @@ class TestPredictiveForwardPass:
         np.testing.assert_allclose(
             np.array(pred_out), np.array(stock_out), rtol=1e-4, atol=1e-5)
 
+    def test_faithful_cache_miss_matches_stock(self, synthetic_model_dir):
+        """Exact cache misses preserve output even when capacity is constrained."""
+        from mlx_moe.lazy_experts.core import enable_lazy_experts
+
+        model, model_path = synthetic_model_dir
+        mx.random.seed(43)
+        x = mx.random.normal((1, 1, INPUT_DIMS))
+        indices = mx.array([[1, 6]])
+
+        stock_out = model.layers[0].mlp.switch_mlp(x, indices)
+        mx.eval(stock_out)
+
+        enable_lazy_experts(model, model_path, cache_capacity_per_layer=2)
+        faithful_out = model.layers[0].mlp.switch_mlp(x, indices)
+        mx.eval(faithful_out)
+
+        np.testing.assert_allclose(
+            np.array(faithful_out), np.array(stock_out), rtol=1e-4, atol=1e-5
+        )
+
 
 class TestSkipFallbackForwardPass:
     def test_output_with_cache_misses(self, synthetic_model_dir):
@@ -671,6 +691,25 @@ class TestServerEndpoints:
         srv.load()
 
         assert captured["pin_top_k"] == 32
+
+    def test_server_load_passes_faithful_policy(self, monkeypatch):
+        import importlib
+        from mlx_moe.server import Server
+
+        generate_mod = importlib.import_module("mlx_moe.lazy_experts.generate")
+        captured = {}
+
+        def fake_startup(model_name, prompt, **kwargs):
+            captured.update(kwargs)
+            return object(), SimpleNamespace(has_chat_template=False), "."
+
+        monkeypatch.setattr(generate_mod, "_startup", fake_startup)
+
+        srv = Server("test-model/fake", expert_policy="faithful", warmup="none")
+        srv.load()
+
+        assert captured["expert_policy"] == "faithful"
+        assert srv._profile_path is None
 
     def test_dynamic_update_policy_high_fallback_aggressive(self, server):
         interval, budget = server._dynamic_update_policy(

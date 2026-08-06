@@ -187,10 +187,16 @@ class Server:
                  max_input_tokens: int = MAX_INPUT_TOKENS,
                  kv_bits: int | None = None,
                  warmup: str = "hybrid",
-                 kv_cache_slots: int = 1):
+                 kv_cache_slots: int = 1,
+                 adaptive_growth: bool = False,
+                 expert_policy: str = "approximate"):
+        if expert_policy not in {"approximate", "faithful"}:
+            raise ValueError("expert_policy must be 'approximate' or 'faithful'")
         self._model_name = model_name
         self._capacity = capacity
-        self._profile_path = profile_path or _find_profile(model_name)
+        self._profile_path = profile_path or (
+            _find_profile(model_name) if expert_policy == "approximate" else None
+        )
         self._pin_top_k = pin_top_k
         self._model = None
         self._tokenizer = None
@@ -202,6 +208,8 @@ class Server:
         self._warmup = warmup
         self._kv_cache_slots = max(1, kv_cache_slots)
         self._kv_cache = OrderedDict()
+        self._adaptive_growth = adaptive_growth
+        self._expert_policy = expert_policy
 
     def load(self):
         from .lazy_experts.generate import _startup
@@ -213,16 +221,17 @@ class Server:
             capacity=self._capacity,
             warmup=self._warmup,
             pin_top_k=self._pin_top_k,
+            expert_policy=self._expert_policy,
         )
         self._model = model
         self._tokenizer = tokenizer
         self._memory_gb = mx.get_active_memory() / 1e9
-        if self._warmup == "hybrid":
+        if self._warmup == "hybrid" and self._expert_policy == "approximate":
             self._run_startup_refinement()
 
     def _run_startup_refinement(self) -> None:
         import mlx_lm as _mlx_lm
-        from .lazy_experts.core import dynamic_cache_update
+        from .lazy_experts.core import adaptive_cache_growth, dynamic_cache_update
 
         prompts = [
             "Write Python code that validates JSON input and returns structured errors.",
@@ -238,9 +247,10 @@ class Server:
         total_swaps = 0
         total_requests = 0
         total_fallbacks = 0
+        total_grown = 0
 
-        def _accumulate(stats: list[dict]) -> tuple[int, int]:
-            nonlocal calls, total_swaps, total_requests, total_fallbacks
+        def _accumulate(stats: list[dict]) -> tuple[int, int, int]:
+            nonlocal calls, total_swaps, total_requests, total_fallbacks, total_grown
             calls += 1
             swaps = sum(s.get("swaps", 0) for s in stats)
             requests = sum(s.get("requests", 0) for s in stats)
@@ -248,7 +258,10 @@ class Server:
             total_swaps += swaps
             total_requests += requests
             total_fallbacks += fallbacks
-            return swaps, requests
+            if self._adaptive_growth and requests > 0:
+                growth = adaptive_cache_growth(self._model, fallbacks / requests)
+                total_grown += growth.get("grown", 0)
+            return swaps, requests, fallbacks
 
         round_rates = []
         for prompt_text in prompts:
@@ -270,7 +283,9 @@ class Server:
                 _accumulate(dynamic_cache_update(self._model, max_layer_updates=budget))
 
             for _ in range(8):
-                swaps, requests = _accumulate(dynamic_cache_update(self._model, max_layer_updates=32))
+                swaps, requests, _ = _accumulate(
+                    dynamic_cache_update(self._model, max_layer_updates=32)
+                )
                 if swaps == 0 and requests == 0:
                     break
 
@@ -284,7 +299,7 @@ class Server:
         print(
             f"  Startup refine: {time.perf_counter() - t0:.1f}s "
             f"(calls={calls}, swaps={total_swaps}, fallback_rate={fallback_rate * 100:.2f}%, "
-            f"round_rates={round_str})"
+            f"grown={total_grown}, round_rates={round_str})"
         )
 
     def _encode_prompt(self, prompt: str) -> list[int]:
@@ -345,7 +360,7 @@ class Server:
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.models import cache as cache_module
-        from .lazy_experts.core import dynamic_cache_update
+        from .lazy_experts.core import adaptive_cache_growth, dynamic_cache_update
 
         # Find longest common prefix with cached KV from previous request
         prompt_cache = None
@@ -392,6 +407,7 @@ class Server:
         dcu_swaps = 0
         dcu_requests = 0
         dcu_fallbacks = 0
+        dcu_grown = 0
         no_swap_streak = 0
         low_fallback_streak = 0
         last_window_fallback_rate = 1.0
@@ -411,6 +427,9 @@ class Server:
                 gen_tokens = resp.generation_tokens
                 decode_tps = resp.generation_tps
                 yield resp
+
+                if self._expert_policy == "faithful":
+                    continue
 
                 interval, budget = self._dynamic_update_policy(
                     resp.generation_tokens,
@@ -432,6 +451,11 @@ class Server:
 
                 if requests > 0:
                     last_window_fallback_rate = fallbacks / requests
+                    if self._adaptive_growth:
+                        growth = adaptive_cache_growth(
+                            self._model, last_window_fallback_rate
+                        )
+                        dcu_grown += growth.get("grown", 0)
 
                 if swaps == 0:
                     no_swap_streak += 1
@@ -457,8 +481,9 @@ class Server:
                     f"  [telemetry] cache_key={cache_key} "
                     f"prefill={prefill_ms:.1f}ms ttft={ttft_ms:.1f}ms "
                     f"decode={decode_tps:.1f} tok/s tokens={gen_tokens} "
+                    f"expert_policy={self._expert_policy} "
                     f"dcu_calls={dcu_calls} swaps={dcu_swaps} "
-                    f"fallback_rate={fallback_rate * 100:.2f}%"
+                    f"fallback_rate={fallback_rate * 100:.2f}% grown={dcu_grown}"
                 )
 
     def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
@@ -945,14 +970,18 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                kv_bits: int | None = None,
                warmup: str = "hybrid",
                kv_cache_slots: int = 1,
-               shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT):
+               shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT,
+               adaptive_growth: bool = False,
+               expert_policy: str = "approximate"):
     import uvicorn
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
                     pin_top_k=pin_top_k,
                     max_tokens=max_tokens, max_input_tokens=max_input_tokens,
                     kv_bits=kv_bits, warmup=warmup,
-                    kv_cache_slots=kv_cache_slots)
+                    kv_cache_slots=kv_cache_slots,
+                    adaptive_growth=adaptive_growth,
+                    expert_policy=expert_policy)
 
     print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")
@@ -963,6 +992,8 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
     defaults = _sampling_defaults(model_name)
     print(f"  Limits:   {max_input_tokens} input, {max_tokens} output")
     print(f"  KV cache: {kv_cache_slots} slot(s)")
+    print(f"  Adaptive growth: {'on' if adaptive_growth else 'off'}")
+    print(f"  Expert policy: {expert_policy}")
     print(f"  Shutdown: {shutdown_timeout}s graceful timeout")
     if defaults:
         print(f"  Sampling: {defaults}")

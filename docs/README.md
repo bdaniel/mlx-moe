@@ -36,5 +36,13 @@ flowchart TD
 - Forward path stays lazy in predictive modules (no `mx.eval()` in module `__call__`).
 - Dynamic cache updates happen between tokens, not inside forward.
 - Skip-fallback masking is enabled so misses do not inject wrong-expert outputs.
+- Faithful policy loads every routed expert and never substitutes or skips a miss.
 - Startup chooses one source of truth for expert state: prepacked, saved cache-state, or fresh discovery/profile path.
 - Capacity and wiring target Metal working-set limits, not total RAM.
+
+## Related Work
+
+The faithful expert policy and planned routing-aware prefetch experiments are
+independently implemented in MLX, inspired by Colibri's documented memory-tiering
+and exact-semantics design: https://github.com/JustVugg/colibri. No Colibri source
+code is included in this repository.

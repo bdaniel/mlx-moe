@@ -68,8 +68,17 @@ def _dynamic_update_policy(
     return interval, budget
 
 
-def _stream_with_dynamic_updates(model, responses):
-    from .core import dynamic_cache_update
+def _stream_with_dynamic_updates(
+    model,
+    responses,
+    on_update=None,
+    adaptive_growth: bool = False,
+):
+    if getattr(model, "_expert_policy", "approximate") == "faithful":
+        yield from responses
+        return
+
+    from .core import adaptive_cache_growth, dynamic_cache_update
 
     no_swap_streak = 0
     low_fallback_streak = 0
@@ -87,12 +96,19 @@ def _stream_with_dynamic_updates(model, responses):
             continue
 
         stats = dynamic_cache_update(model, max_layer_updates=budget)
+        growth = None
+        if on_update is not None:
+            on_update(stats, growth)
         swaps = sum(s.get("swaps", 0) for s in stats)
         fallbacks = sum(s.get("fallbacks", 0) for s in stats)
         requests = sum(s.get("requests", 0) for s in stats)
 
         if requests > 0:
             last_fallback_rate = fallbacks / requests
+            if adaptive_growth:
+                growth = adaptive_cache_growth(model, last_fallback_rate)
+                if on_update is not None:
+                    on_update([], growth)
             if last_fallback_rate <= 0.005:
                 low_fallback_streak += 1
             else:
@@ -136,7 +152,9 @@ def _requires_strict_false_load(model_path: Path | None) -> bool:
         return False
 
     config = json.loads(config_path.read_text())
-    return config.get("model_type") == "qwen3_5_moe" and "vision_config" in config
+    return config.get("model_type") in {"qwen3_5", "qwen3_5_moe"} and (
+        "vision_config" in config
+    )
 
 
 def _load_model_and_tokenizer(model_name: str, lazy: bool = True):
@@ -155,7 +173,9 @@ def _load_model_and_tokenizer(model_name: str, lazy: bool = True):
 
     try:
         model, tokenizer = _mlx_lm.load(model_name, lazy=lazy)
-        model_path = hf_repo_to_path(model_name)
+        model_path = _model_path_for_name(model_name)
+        if model_path is None:
+            model_path = hf_repo_to_path(model_name)
         return model, tokenizer, model_path
     except ValueError as exc:
         msg = str(exc)
@@ -180,6 +200,7 @@ def _startup(
     capacity=None,
     warmup="hybrid",
     pin_top_k: int | None = None,
+    expert_policy: str = "approximate",
 ):
     """Shared startup for generate and stream_generate.
 
@@ -191,6 +212,11 @@ def _startup(
 
     Returns (model, tokenizer, model_path) with all warmup/upgrade/wiring done.
     """
+    if expert_policy not in {"approximate", "faithful"}:
+        raise ValueError("expert_policy must be 'approximate' or 'faithful'")
+    if expert_policy == "faithful" and profile_path is not None:
+        raise ValueError("expert profiles require expert_policy='approximate'")
+
     import mlx_lm as _mlx_lm
     from .core import upgrade_to_predictive
 
@@ -246,19 +272,55 @@ def _startup(
     # async_eval pipelining and cause OOM with large experts (~170 MB for Mixtral 22B).
     # Fallbacks map to slot 0; between-token swapping corrects misses progressively.
     enable_lazy_experts(
-        model, model_path, cache_capacity_per_layer=capacity, predictive=True
+        model,
+        model_path,
+        cache_capacity_per_layer=capacity,
+        predictive=expert_policy == "approximate",
     )
+    model._expert_policy = expert_policy
     mx.eval(model.parameters())
 
     shard_map = _build_shard_map(model_path)
     all_shards = sorted(set(shard_map.values()))
     model._st_map = SafetensorsMap(all_shards)
+    if expert_policy == "faithful":
+        for layer in model.layers:
+            switch, _ = _find_switch_mlp(layer)
+            if switch is None:
+                continue
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                proj = getattr(switch, proj_name, None)
+                if hasattr(proj, "_st_map"):
+                    proj._st_map = model._st_map
 
     t_load = time.perf_counter() - t0
     print(
         f"  Model load: {t_load:.1f}s ({mx.get_active_memory() / 1e9:.1f} GB) "
-        f"[{num_experts} experts, cap={capacity}]"
+        f"[{num_experts} experts, cap={capacity}, policy={expert_policy}]"
     )
+
+    if expert_policy == "faithful":
+        if warmup != "none":
+            t0 = time.perf_counter()
+            warmup_tokens = 50 if warmup == "full" else 10
+            _mlx_lm.generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=warmup_tokens,
+                verbose=False,
+            )
+            print(f"  Faithful cache warmup: {time.perf_counter() - t0:.1f}s")
+
+        t_total = time.perf_counter() - t_total_start
+        print(f"  Total startup: {t_total:.1f}s")
+        if hasattr(mx, "set_wired_limit"):
+            active = mx.get_active_memory()
+            limit = int(mx.device_info()["memory_size"] * 0.75)
+            wired = min(active, limit)
+            mx.set_wired_limit(wired)
+            print(f"  Wired {wired / 1e9:.1f} GB in residency set")
+        return model, tokenizer, model_path
 
     cache_path = None
     prepacked_path = None
@@ -394,6 +456,7 @@ def generate(
     kv_bits: int | None = None,
     warmup: str = "hybrid",
     pin_top_k: int | None = None,
+    expert_policy: str = "approximate",
 ) -> str:
     """One-call generation with all optimizations.
 
@@ -409,6 +472,8 @@ def generate(
             KV memory at 8-bit. None = fp16 (default).
         warmup: "hybrid" (default), "full", or "none".
         pin_top_k: If set, pin top-K profile experts per layer. Use 0 for no pinning.
+        expert_policy: "approximate" uses predictive fallback dispatch; "faithful"
+            loads every routed expert exactly and may be substantially slower.
 
     Returns:
         Generated text string.
@@ -424,6 +489,7 @@ def generate(
         capacity=capacity,
         warmup=warmup,
         pin_top_k=pin_top_k,
+        expert_policy=expert_policy,
     )
 
     kv_kwargs = {}
@@ -456,6 +522,7 @@ def stream_generate(
     kv_bits: int | None = None,
     warmup: str = "hybrid",
     pin_top_k: int | None = None,
+    expert_policy: str = "approximate",
 ):
     """Streaming variant of generate.
 
@@ -476,6 +543,7 @@ def stream_generate(
         capacity=capacity,
         warmup=warmup,
         pin_top_k=pin_top_k,
+        expert_policy=expert_policy,
     )
 
     kv_kwargs = {}
@@ -514,6 +582,7 @@ class Session:
         capacity: int | None = None,
         kv_bits: int | None = None,
         pin_top_k: int | None = None,
+        expert_policy: str = "approximate",
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir
@@ -522,6 +591,7 @@ class Session:
         self._capacity = capacity
         self._kv_bits = kv_bits
         self._pin_top_k = pin_top_k
+        self._expert_policy = expert_policy
         self._model = None
         self._tokenizer = None
         self._model_path = None
@@ -537,19 +607,21 @@ class Session:
                 prepacked=self._prepacked,
                 capacity=self._capacity,
                 pin_top_k=self._pin_top_k,
+                expert_policy=self._expert_policy,
             )
             self._last_prompt = prompt
         elif self._last_prompt != prompt:
-            t0 = time.perf_counter()
-            with _with_cache_limit_zero(_WARMUP_CACHE):
-                fast_delta_warmup(
-                    self._model,
-                    self._tokenizer,
-                    self._model_path,
-                    prompt,
-                    discovery_tokens=10,
-                )
-            print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
+            if self._expert_policy == "approximate":
+                t0 = time.perf_counter()
+                with _with_cache_limit_zero(_WARMUP_CACHE):
+                    fast_delta_warmup(
+                        self._model,
+                        self._tokenizer,
+                        self._model_path,
+                        prompt,
+                        discovery_tokens=10,
+                    )
+                print(f"  Delta warmup: {time.perf_counter() - t0:.1f}s")
             self._last_prompt = prompt
 
     def _kv_kwargs(self):

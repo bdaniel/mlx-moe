@@ -28,6 +28,14 @@ def main():
     serve.add_argument("--warmup", choices=["hybrid", "full", "none"], default="hybrid",
                        help="Warmup strategy: hybrid (default, profile + real generation), "
                             "full (Phase 2 LCP, ~90s, 0%% fallback), none (profile/discovery only)")
+    serve.add_argument("--adaptive-growth", action="store_true",
+                       help="Grow expert caches during generation when fallback is high and memory allows.")
+    serve.add_argument(
+        "--expert-policy",
+        choices=["approximate", "faithful"],
+        default="approximate",
+        help="Expert miss policy: approximate fallback (default) or exact SSD loading.",
+    )
 
     args = parser.parse_args()
 
@@ -46,6 +54,8 @@ def main():
             warmup=args.warmup,
             kv_cache_slots=args.kv_cache_slots,
             shutdown_timeout=args.shutdown_timeout,
+            adaptive_growth=args.adaptive_growth,
+            expert_policy=args.expert_policy,
         )
     else:
         parser.print_help()

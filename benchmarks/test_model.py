@@ -67,10 +67,19 @@ def run_baseline(model_name, max_tokens=200):
             "load_time": load_time, "gen_time": gen_time}
 
 
-def run_mlx_moe(model_name, capacity=None, max_tokens=200):
+def run_mlx_moe(
+    model_name,
+    capacity=None,
+    max_tokens=200,
+    expert_policy="approximate",
+):
     """Run mlx-moe generation with diagnostics."""
     from mlx_moe.lazy_experts.generate import _startup, _stream_with_dynamic_updates
-    from mlx_moe.lazy_experts.core import dynamic_cache_update, get_fallback_stats
+    from mlx_moe.lazy_experts.core import (
+        adaptive_cache_growth,
+        dynamic_cache_update,
+        get_fallback_stats,
+    )
     from mlx_moe.lazy_experts.loading import _find_switch_mlp, _detect_num_experts
     import mlx_lm
 
@@ -82,7 +91,12 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
 
     t0 = time.perf_counter()
     model, tokenizer, model_path = _startup(
-        model_name, prompt_text, capacity=capacity)
+        model_name,
+        prompt_text,
+        capacity=capacity,
+        warmup="none" if expert_policy == "faithful" else "hybrid",
+        expert_policy=expert_policy,
+    )
     startup_time = time.perf_counter() - t0
     mem_gb = mx.get_active_memory() / 1e9
 
@@ -120,15 +134,50 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
         t0 = time.perf_counter()
         tokens = 0
         text = ""
+        dcu_calls = 0
+        dcu_swaps = 0
+        dcu_requests = 0
+        dcu_fallbacks = 0
+        grown_experts = 0
+        growth_events = 0
+        last_headroom_gb = None
+
+        def track_update(stats, growth=None):
+            nonlocal dcu_calls, dcu_swaps, dcu_requests, dcu_fallbacks
+            nonlocal grown_experts, growth_events, last_headroom_gb
+            if stats:
+                dcu_calls += 1
+                dcu_swaps += sum(s.get("swaps", 0) for s in stats)
+                dcu_requests += sum(s.get("requests", 0) for s in stats)
+                dcu_fallbacks += sum(s.get("fallbacks", 0) for s in stats)
+            if growth:
+                headroom_gb = growth.get("headroom_gb")
+                if headroom_gb is not None:
+                    last_headroom_gb = headroom_gb
+                grown = growth.get("grown", 0)
+                if grown:
+                    grown_experts += grown
+                    growth_events += 1
+
         responses = mlx_lm.stream_generate(
             model, tokenizer, prompt=prompt, max_tokens=max_tokens
         )
-        for resp in _stream_with_dynamic_updates(model, responses):
+        for resp in _stream_with_dynamic_updates(
+            model, responses, on_update=track_update, adaptive_growth=True
+        ):
             text += resp.text
             tokens = resp.generation_tokens
 
-        for _ in range(4):
+        for _ in range(4 if expert_policy == "approximate" else 0):
             stats = dynamic_cache_update(model, max_layer_updates=32)
+            requests = sum(s.get("requests", 0) for s in stats)
+            fallbacks = sum(s.get("fallbacks", 0) for s in stats)
+            growth = (
+                adaptive_cache_growth(model, fallbacks / requests)
+                if requests
+                else None
+            )
+            track_update(stats, growth)
             if not any(s.get("swaps", 0) or s.get("requests", 0) for s in stats):
                 break
 
@@ -144,6 +193,15 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
         print(f"  {tokens} tokens, {tps:.1f} tok/s, {gen_time:.1f}s")
         print(f"  Memory: {mem_after:.1f} GB")
         print(f"  Fallback: {fallback_rate*100:.1f}% ({fb_fallbacks}/{fb_requests})")
+        headroom = (
+            f", headroom={last_headroom_gb:.1f} GB"
+            if last_headroom_gb is not None
+            else ""
+        )
+        print(
+            f"  Updates: calls={dcu_calls}, swaps={dcu_swaps}, "
+            f"grown={grown_experts} ({growth_events} events){headroom}"
+        )
         print(f"  Output: {text[:150]}...")
 
         results.append({
@@ -153,6 +211,11 @@ def run_mlx_moe(model_name, capacity=None, max_tokens=200):
             "gen_time": gen_time,
             "memory_gb": mem_after,
             "fallback_rate": fallback_rate,
+            "dcu_calls": dcu_calls,
+            "dcu_swaps": dcu_swaps,
+            "dcu_fallback_rate": dcu_fallbacks / dcu_requests if dcu_requests else 0.0,
+            "grown_experts": grown_experts,
+            "growth_events": growth_events,
         })
 
     # Cleanup
@@ -181,9 +244,18 @@ def main():
                         help="Also run stock mlx-lm baseline")
     parser.add_argument("--tokens", "-t", type=int, default=200,
                         help="Max tokens to generate (default: 200)")
+    parser.add_argument(
+        "--expert-policy",
+        choices=("approximate", "faithful"),
+        default="approximate",
+    )
     args = parser.parse_args()
 
-    all_results = {"model": args.model, "capacity": args.capacity}
+    all_results = {
+        "model": args.model,
+        "capacity": args.capacity,
+        "expert_policy": args.expert_policy,
+    }
 
     if args.baseline:
         baseline = run_baseline(args.model, max_tokens=args.tokens)
@@ -191,7 +263,12 @@ def main():
         # Need a fresh process for mlx-moe after baseline since Metal buffers leak
         print("\n[NOTE: For accurate mlx-moe results after baseline, run in separate process]")
 
-    flash = run_mlx_moe(args.model, capacity=args.capacity, max_tokens=args.tokens)
+    flash = run_mlx_moe(
+        args.model,
+        capacity=args.capacity,
+        max_tokens=args.tokens,
+        expert_policy=args.expert_policy,
+    )
     all_results["mlx_moe"] = flash
 
     print(f"\n{'='*60}")
