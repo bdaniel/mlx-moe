@@ -84,6 +84,7 @@ def _enable_lazy(model, shard_map: dict) -> int:
                 bits=orig.bits,
                 mode=orig.mode,
                 shard_map=shard_map,
+                linear_bias=orig.get("bias"),
             )
             replacement.num_experts = num_experts
             setattr(switch, name, replacement)
@@ -114,6 +115,7 @@ def _enable_cached(model, shard_map: dict, capacity: int) -> int:
                 proj_name=name,
                 cache=layer_cache,
                 shard_map=shard_map,
+                linear_bias=orig.get("bias"),
             )
             replacement.num_experts = num_experts
             setattr(switch, name, replacement)
@@ -168,6 +170,7 @@ def reset_to_cached(model, model_path: Path, capacity: int) -> int:
                 proj_name=name,
                 cache=layer_cache,
                 shard_map=shard_map,
+                linear_bias=pred_mod.get("bias"),
             )
             replacement.num_experts = num_experts
             setattr(switch, name, replacement)
@@ -265,7 +268,10 @@ def upgrade_to_predictive(
             "pred_cache": pred_cache,
             "harvested": harvested,
             "to_load": to_load,
-            "has_bias": has_bias if has_bias is not None else True,
+            "has_bias": has_bias if has_bias is not None else any(
+                f"{key_base}.{name}.biases" in shard_map
+                for name in ("gate_proj", "up_proj", "down_proj")
+            ),
             "phase2_mods": phase2_mods,
             "disc_count": len(discovered),
             "filler_count": len(filler),
@@ -362,6 +368,7 @@ def upgrade_to_predictive(
                 mode=phase2_mod.mode,
                 proj_name=name,
                 cache=pred_cache,
+                linear_bias=phase2_mod.get("bias"),
             )
             replacement.num_experts = pred_cache.num_experts
             setattr(switch, name, replacement)
@@ -481,7 +488,10 @@ def upgrade_to_predictive_with_pinning(
             "pred_cache": pred_cache,
             "harvested": harvested,
             "to_load": to_load,
-            "has_bias": has_bias if has_bias is not None else True,
+            "has_bias": has_bias if has_bias is not None else any(
+                f"{key_base}.{name}.biases" in shard_map
+                for name in ("gate_proj", "up_proj", "down_proj")
+            ),
             "phase2_mods": phase2_mods,
             "lcp_cache": lcp_cache,
             "n_pinned": n_pinned,
@@ -577,6 +587,7 @@ def upgrade_to_predictive_with_pinning(
                 mode=phase2_mod.mode,
                 proj_name=name,
                 cache=pred_cache,
+                linear_bias=phase2_mod.get("bias"),
             )
             replacement.num_experts = pred_cache.num_experts
             setattr(switch, name, replacement)
@@ -645,6 +656,97 @@ def dynamic_cache_update(model, max_layer_updates: int = 12) -> list[dict]:
         layer_stats["layer"] = i
         stats.append(layer_stats)
     return stats
+
+
+def get_faithful_stats(model) -> dict:
+    """Aggregate exact-loading cache telemetry across MoE layers."""
+    caches = {}
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+        caches[id(proj._cache)] = proj._cache
+
+    hits = sum(cache.hits for cache in caches.values())
+    misses = sum(cache.misses for cache in caches.values())
+    requests = hits + misses
+    return {
+        "layers": len(caches),
+        "requests": requests,
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": hits / requests if requests else 0.0,
+        "load_calls": sum(cache.load_calls for cache in caches.values()),
+        "experts_loaded": sum(cache.experts_loaded for cache in caches.values()),
+        "bytes_loaded": sum(cache.bytes_loaded for cache in caches.values()),
+        "load_seconds": sum(cache.load_seconds for cache in caches.values()),
+    }
+
+
+def adaptive_faithful_capacity(
+    model,
+    *,
+    grow_by: int = 8,
+    target_fraction: float = 0.60,
+) -> dict:
+    """Grow exact caches while projected full capacity stays below memory target."""
+    caches = []
+    for i, layer in enumerate(model.layers):
+        switch, _ = _find_switch_mlp(layer, i)
+        if switch is None:
+            continue
+        proj = getattr(switch, "up_proj", None)
+        if not isinstance(proj, CachedQuantizedSwitchLinear):
+            continue
+        cache = proj._cache
+        complete = next(
+            (entry for entry in cache.entries.values() if len(entry) == 3),
+            None,
+        )
+        if complete is None:
+            continue
+        slot_bytes = sum(
+            tensor.nbytes
+            for weights in complete.values()
+            for tensor in weights
+            if tensor is not None
+        )
+        caches.append((cache, int(proj.num_experts), slot_bytes))
+
+    if not caches:
+        return {"grown": 0, "layers": 0, "headroom_gb": None}
+
+    target_bytes = int(
+        mx.device_info()["max_recommended_working_set_size"] * target_fraction
+    )
+    active_bytes = mx.get_active_memory()
+    allocator_cache_bytes = mx.get_cache_memory()
+    reserved_bytes = sum(
+        max(0, cache.capacity - len(cache.entries)) * slot_bytes
+        for cache, _, slot_bytes in caches
+    )
+    projected_bytes = active_bytes + allocator_cache_bytes + reserved_bytes
+    level_bytes = sum(slot_bytes for _, _, slot_bytes in caches)
+    available_levels = max(0, (target_bytes - projected_bytes) // level_bytes)
+    max_capacity_growth = min(
+        num_experts - cache.capacity for cache, num_experts, _ in caches
+    )
+    increment = min(grow_by, available_levels, max_capacity_growth)
+    headroom_gb = (target_bytes - projected_bytes) / 1e9
+    if increment <= 0:
+        return {"grown": 0, "layers": 0, "headroom_gb": headroom_gb}
+
+    for cache, _, _ in caches:
+        cache.capacity += increment
+    return {
+        "grown": increment * len(caches),
+        "layers": len(caches),
+        "headroom_gb": headroom_gb,
+        "capacity": caches[0][0].capacity,
+    }
 
 
 def adaptive_cache_growth(
@@ -864,7 +966,7 @@ def enable_skip_fallback(model) -> int:
         moe_block = _find_moe_block(layer)
         if moe_block is None:
             continue
-        switch = getattr(moe_block, "switch_mlp", None)
+        switch, _ = _find_switch_mlp(layer, i)
         if switch is None:
             continue
         proj = getattr(switch, "up_proj", None)
@@ -872,13 +974,17 @@ def enable_skip_fallback(model) -> int:
             continue
 
         cache = proj._cache
-        _patch_moe_block_skip_fallback(moe_block, cache)
+        switch_attr = "switch_mlp" if hasattr(moe_block, "switch_mlp") else "experts"
+        gate_attr = "gate" if hasattr(moe_block, "gate") else "router"
+        _patch_moe_block_skip_fallback(moe_block, cache, switch_attr, gate_attr)
         patched += 1
 
     return patched
 
 
-def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
+def _patch_moe_block_skip_fallback(
+    moe_block, cache: PredictiveExpertCache, switch_attr="switch_mlp", gate_attr="gate"
+):
     """Replace a MoE block's __call__ with one that masks missing expert scores.
 
     Handles two gate styles:
@@ -886,7 +992,7 @@ def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
       - GLM-style: gate returns (inds, scores) tuple directly
     """
     def patched_call(self, x):
-        gate_out = self.gate(x)
+        gate_out = getattr(self, gate_attr)(x)
         if isinstance(gate_out, tuple):
             inds, scores = gate_out
         else:
@@ -903,7 +1009,7 @@ def _patch_moe_block_skip_fallback(moe_block, cache: PredictiveExpertCache):
         score_sum = scores.sum(axis=-1, keepdims=True)
         scores = mx.where(score_sum > 0, scores / score_sum, scores)
 
-        y = self.switch_mlp(x, inds)
+        y = getattr(self, switch_attr)(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
         if hasattr(self, "shared_expert") and hasattr(self, "shared_expert_gate"):

@@ -1,5 +1,7 @@
 # Copyright © 2023-2025 Apple Inc.
 
+import time
+
 import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
@@ -21,7 +23,8 @@ class ExpertCache:
     """
     __slots__ = ('entries', 'frequency', 'last_active', 'step',
                  '_proj_count', 'capacity', 'hits', 'misses',
-                 'all_seen')
+                 'all_seen', 'load_calls', 'experts_loaded',
+                 'bytes_loaded', 'load_seconds', '_projections')
 
     def __init__(self, capacity: int):
         self.entries: dict[int, dict[str, tuple]] = {}
@@ -33,6 +36,11 @@ class ExpertCache:
         self.hits = 0
         self.misses = 0
         self.all_seen: set[int] = set()
+        self.load_calls = 0
+        self.experts_loaded = 0
+        self.bytes_loaded = 0
+        self.load_seconds = 0.0
+        self._projections: dict[str, CachedQuantizedSwitchLinear] = {}
 
     def projection_called(self, expert_ids: np.ndarray) -> None:
         """Called once per projection. Increments step every 3rd call."""
@@ -56,6 +64,60 @@ class ExpertCache:
         if expert_id not in self.entries:
             self.entries[expert_id] = {}
         self.entries[expert_id][proj_name] = (w, s, b)
+
+    def register_projection(self, projection) -> None:
+        self._projections[projection._proj_name] = projection
+
+    def load_projection_group(self, expert_ids: list[int]) -> None:
+        """Load every missing projection for routed experts with one eval barrier."""
+        plans = []
+        eval_arrays = []
+        load_started = time.perf_counter()
+
+        for proj_name in ("up_proj", "gate_proj", "down_proj"):
+            projection = self._projections.get(proj_name)
+            if projection is None:
+                continue
+            missing = [
+                eid for eid in expert_ids if self.lookup(eid, proj_name) is None
+            ]
+            if not missing:
+                continue
+            plans.append((proj_name, projection, missing))
+
+        if not plans:
+            return
+
+        loaded = [
+            projection._load_batch(missing)
+            for _, projection, missing in plans
+        ]
+
+        pending = []
+        for (proj_name, _, missing), (w_batch, s_batch, b_batch) in zip(
+            plans, loaded
+        ):
+            pending.append((proj_name, missing, w_batch, s_batch, b_batch))
+            eval_arrays.extend((w_batch, s_batch))
+            if b_batch is not None:
+                eval_arrays.append(b_batch)
+
+        mx.eval(*eval_arrays)
+        self.load_calls += 1
+        for proj_name, missing, w_batch, s_batch, b_batch in pending:
+            self.experts_loaded += len(missing)
+            self.bytes_loaded += w_batch.nbytes + s_batch.nbytes
+            if b_batch is not None:
+                self.bytes_loaded += b_batch.nbytes
+            for i, eid in enumerate(missing):
+                self.put(
+                    eid,
+                    proj_name,
+                    w_batch[i],
+                    s_batch[i],
+                    b_batch[i] if b_batch is not None else None,
+                )
+        self.load_seconds += time.perf_counter() - load_started
 
     def evict_if_needed(self, protected: set[int]) -> None:
         """Evict lowest-priority experts until at or under capacity."""
@@ -91,7 +153,8 @@ class LazyQuantizedSwitchLinear(nn.Module):
     """
 
     def __init__(self, shard_path: str, key_prefix: str, group_size: int,
-                 bits: int, mode: str, shard_map: dict[str, str] | None = None):
+                 bits: int, mode: str, shard_map: dict[str, str] | None = None,
+                 linear_bias=None):
         super().__init__()
         self._shard_path = shard_path
         self._key_prefix = key_prefix
@@ -100,6 +163,8 @@ class LazyQuantizedSwitchLinear(nn.Module):
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
+        if linear_bias is not None:
+            self.bias = linear_bias
         self.freeze()
 
     def _load_expert_subset(self, expert_ids: mx.array):
@@ -119,7 +184,7 @@ class LazyQuantizedSwitchLinear(nn.Module):
         remap[unique_ids] = np.arange(len(unique_ids), dtype=np.int32)
         remapped = mx.array(remap[indices_np].reshape(indices.shape))
 
-        return mx.gather_qmm(
+        result = mx.gather_qmm(
             x,
             w,
             s,
@@ -131,6 +196,9 @@ class LazyQuantizedSwitchLinear(nn.Module):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
+        if "bias" in self:
+            result = result + mx.expand_dims(self["bias"][indices], -2)
+        return result
 
 
 class CachedQuantizedSwitchLinear(nn.Module):
@@ -143,7 +211,8 @@ class CachedQuantizedSwitchLinear(nn.Module):
     def __init__(self, shard_path: str, key_prefix: str, group_size: int,
                  bits: int, mode: str, proj_name: str,
                  cache: ExpertCache,
-                 shard_map: dict[str, str] | None = None):
+                 shard_map: dict[str, str] | None = None,
+                 linear_bias=None):
         super().__init__()
         self._shard_path = shard_path
         self._key_prefix = key_prefix
@@ -154,7 +223,25 @@ class CachedQuantizedSwitchLinear(nn.Module):
         self.mode = mode
         self._proj_name = proj_name
         self._cache = cache
+        if linear_bias is not None:
+            self.bias = linear_bias
+        cache.register_projection(self)
         self.freeze()
+
+    def _load_batch(self, expert_ids: list[int]):
+        miss_arr = mx.array(expert_ids)
+        use_mmap = (
+            self._st_map is not None
+            and f"{self._key_prefix}.weight" in self._st_map
+        )
+        shard = None if use_mmap else mx.load(self._shard_path)
+        return _load_experts(
+            self._key_prefix,
+            miss_arr,
+            shard=shard,
+            shard_map=self._shard_map,
+            st_map=self._st_map,
+        )
 
     def __call__(self, x, indices, sorted_indices=False):
         mx.eval(indices)
@@ -175,27 +262,7 @@ class CachedQuantizedSwitchLinear(nn.Module):
                 self._cache.misses += 1
 
         if miss_ids:
-            miss_arr = mx.array(miss_ids)
-            use_mmap = (
-                self._st_map is not None
-                and f"{self._key_prefix}.weight" in self._st_map
-            )
-            shard = None if use_mmap else mx.load(self._shard_path)
-            w_batch, s_batch, b_batch = _load_experts(
-                self._key_prefix,
-                miss_arr,
-                shard=shard,
-                shard_map=self._shard_map,
-                st_map=self._st_map,
-            )
-            mx.eval(w_batch, s_batch) if b_batch is None else mx.eval(w_batch, s_batch, b_batch)
-
-            for i, eid in enumerate(miss_ids):
-                self._cache.put(
-                    eid, self._proj_name,
-                    w_batch[i], s_batch[i],
-                    b_batch[i] if b_batch is not None else None,
-                )
+            self._cache.load_projection_group(miss_ids)
 
         protected = set(int(e) for e in unique_ids)
         self._cache.evict_if_needed(protected)
@@ -221,7 +288,7 @@ class CachedQuantizedSwitchLinear(nn.Module):
         remap[unique_sorted] = np.arange(len(unique_sorted), dtype=np.int32)
         remapped = mx.array(remap[indices_np].reshape(indices.shape))
 
-        return mx.gather_qmm(
+        result = mx.gather_qmm(
             x,
             w_cat,
             s_cat,
@@ -233,6 +300,9 @@ class CachedQuantizedSwitchLinear(nn.Module):
             mode=self.mode,
             sorted_indices=sorted_indices,
         )
+        if "bias" in self:
+            result = result + mx.expand_dims(self["bias"][indices], -2)
+        return result
 
 
 class PredictiveExpertCache:
@@ -475,13 +545,15 @@ class PredictiveCachedSwitchLinear(nn.Module):
     """
 
     def __init__(self, group_size: int, bits: int, mode: str,
-                 proj_name: str, cache: PredictiveExpertCache):
+                 proj_name: str, cache: PredictiveExpertCache, linear_bias=None):
         super().__init__()
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
         self._proj_name = proj_name
         self._cache = cache
+        if linear_bias is not None:
+            self.bias = linear_bias
         self.freeze()
 
     def __call__(self, x, indices, sorted_indices=False):
@@ -489,7 +561,7 @@ class PredictiveCachedSwitchLinear(nn.Module):
             self._cache._indices_buffer.append(indices)
         local_indices = self._cache.remap(indices)
         # Remap breaks sorted order — always pass sorted_indices=False
-        return mx.gather_qmm(
+        result = mx.gather_qmm(
             x,
             self._cache.weights[self._proj_name],
             self._cache.scales[self._proj_name],
@@ -500,6 +572,9 @@ class PredictiveCachedSwitchLinear(nn.Module):
             bits=self.bits,
             mode=self.mode,
         )
+        if "bias" in self:
+            result = result + mx.expand_dims(self["bias"][indices], -2)
+        return result
 
 
 class SyncPredictiveCachedSwitchLinear(nn.Module):
@@ -511,13 +586,15 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
     """
 
     def __init__(self, group_size: int, bits: int, mode: str,
-                 proj_name: str, cache: PredictiveExpertCache):
+                 proj_name: str, cache: PredictiveExpertCache, linear_bias=None):
         super().__init__()
         self.group_size = group_size
         self.bits = bits
         self.mode = mode
         self._proj_name = proj_name
         self._cache = cache
+        if linear_bias is not None:
+            self.bias = linear_bias
         self.freeze()
 
     def __call__(self, x, indices, sorted_indices=False):
@@ -526,7 +603,7 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
         mx.eval(indices)
         local_indices = self._cache.remap(indices)
         # Remap breaks sorted order — always pass sorted_indices=False
-        return mx.gather_qmm(
+        result = mx.gather_qmm(
             x,
             self._cache.weights[self._proj_name],
             self._cache.scales[self._proj_name],
@@ -537,3 +614,6 @@ class SyncPredictiveCachedSwitchLinear(nn.Module):
             bits=self.bits,
             mode=self.mode,
         )
+        if "bias" in self:
+            result = result + mx.expand_dims(self["bias"][indices], -2)
+        return result

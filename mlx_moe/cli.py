@@ -19,6 +19,12 @@ def main():
                        help="Max output tokens per request (default: 4096)")
     serve.add_argument("--max-input-tokens", type=int, default=16384,
                        help="Max input tokens — rejects requests over this (default: 16384)")
+    serve.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=None,
+        help="Prompt chunk size (faithful default: 16; approximate: 2048)",
+    )
     serve.add_argument("--kv-bits", type=int, default=None,
                        help="Quantize KV cache to N bits (8 recommended). Saves ~45%% KV memory.")
     serve.add_argument("--kv-cache-slots", type=int, default=1,
@@ -29,7 +35,7 @@ def main():
                        help="Warmup strategy: hybrid (default, profile + real generation), "
                             "full (Phase 2 LCP, ~90s, 0%% fallback), none (profile/discovery only)")
     serve.add_argument("--adaptive-growth", action="store_true",
-                       help="Grow expert caches during generation when fallback is high and memory allows.")
+                       help="Grow expert caches during generation while memory allows.")
     serve.add_argument(
         "--expert-policy",
         choices=["approximate", "faithful"],
@@ -56,6 +62,7 @@ def main():
             shutdown_timeout=args.shutdown_timeout,
             adaptive_growth=args.adaptive_growth,
             expert_policy=args.expert_policy,
+            prefill_step_size=args.prefill_step_size,
         )
     else:
         parser.print_help()

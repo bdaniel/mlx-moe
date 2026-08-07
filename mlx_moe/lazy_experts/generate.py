@@ -75,7 +75,14 @@ def _stream_with_dynamic_updates(
     adaptive_growth: bool = False,
 ):
     if getattr(model, "_expert_policy", "approximate") == "faithful":
-        yield from responses
+        from .core import adaptive_faithful_capacity
+
+        for resp in responses:
+            yield resp
+            if adaptive_growth:
+                growth = adaptive_faithful_capacity(model)
+                if on_update is not None:
+                    on_update([], growth)
         return
 
     from .core import adaptive_cache_growth, dynamic_cache_update
@@ -300,6 +307,11 @@ def _startup(
     )
 
     if expert_policy == "faithful":
+        # Exact loading creates large short-lived batches. Bound MLX allocator
+        # retention before warmup so evicted experts do not remain wired.
+        mx.set_cache_limit(_WARMUP_CACHE)
+        mx.clear_cache()
+
         if warmup != "none":
             t0 = time.perf_counter()
             warmup_tokens = 50 if warmup == "full" else 10
@@ -309,6 +321,7 @@ def _startup(
                 prompt=prompt,
                 max_tokens=warmup_tokens,
                 verbose=False,
+                prefill_step_size=16,
             )
             print(f"  Faithful cache warmup: {time.perf_counter() - t0:.1f}s")
 
@@ -457,6 +470,8 @@ def generate(
     warmup: str = "hybrid",
     pin_top_k: int | None = None,
     expert_policy: str = "approximate",
+    adaptive_growth: bool = False,
+    prefill_step_size: int | None = None,
 ) -> str:
     """One-call generation with all optimizations.
 
@@ -474,6 +489,9 @@ def generate(
         pin_top_k: If set, pin top-K profile experts per layer. Use 0 for no pinning.
         expert_policy: "approximate" uses predictive fallback dispatch; "faithful"
             loads every routed expert exactly and may be substantially slower.
+        adaptive_growth: Grow caches between tokens within memory headroom.
+        prefill_step_size: Prompt chunk size. Faithful defaults to 16; otherwise
+            uses mlx-lm's default.
 
     Returns:
         Generated text string.
@@ -495,6 +513,8 @@ def generate(
     kv_kwargs = {}
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
+    if prefill_step_size is not None or expert_policy == "faithful":
+        kv_kwargs["prefill_step_size"] = prefill_step_size or 16
 
     text = ""
     for resp in _stream_with_dynamic_updates(
@@ -506,6 +526,7 @@ def generate(
             max_tokens=max_tokens,
             **kv_kwargs,
         ),
+        adaptive_growth=adaptive_growth,
     ):
         text += resp.text
     return text
@@ -523,6 +544,8 @@ def stream_generate(
     warmup: str = "hybrid",
     pin_top_k: int | None = None,
     expert_policy: str = "approximate",
+    adaptive_growth: bool = False,
+    prefill_step_size: int | None = None,
 ):
     """Streaming variant of generate.
 
@@ -549,12 +572,15 @@ def stream_generate(
     kv_kwargs = {}
     if kv_bits is not None:
         kv_kwargs = dict(kv_bits=kv_bits, kv_group_size=64, quantized_kv_start=0)
+    if prefill_step_size is not None or expert_policy == "faithful":
+        kv_kwargs["prefill_step_size"] = prefill_step_size or 16
 
     yield from _stream_with_dynamic_updates(
         model,
         _mlx_lm.stream_generate(
             model, tokenizer, prompt=prompt, max_tokens=max_tokens, **kv_kwargs
         ),
+        adaptive_growth=adaptive_growth,
     )
 
 
@@ -583,6 +609,8 @@ class Session:
         kv_bits: int | None = None,
         pin_top_k: int | None = None,
         expert_policy: str = "approximate",
+        adaptive_growth: bool = False,
+        prefill_step_size: int | None = None,
     ):
         self._model_name = model_name
         self._cache_dir = cache_dir
@@ -592,6 +620,8 @@ class Session:
         self._kv_bits = kv_bits
         self._pin_top_k = pin_top_k
         self._expert_policy = expert_policy
+        self._adaptive_growth = adaptive_growth
+        self._prefill_step_size = prefill_step_size
         self._model = None
         self._tokenizer = None
         self._model_path = None
@@ -625,9 +655,16 @@ class Session:
             self._last_prompt = prompt
 
     def _kv_kwargs(self):
-        if self._kv_bits is None:
-            return {}
-        return dict(kv_bits=self._kv_bits, kv_group_size=64, quantized_kv_start=0)
+        kwargs = {}
+        if self._kv_bits is not None:
+            kwargs.update(
+                kv_bits=self._kv_bits,
+                kv_group_size=64,
+                quantized_kv_start=0,
+            )
+        if self._prefill_step_size is not None or self._expert_policy == "faithful":
+            kwargs["prefill_step_size"] = self._prefill_step_size or 16
+        return kwargs
 
     def stream(self, prompt: str, max_tokens: int = 200):
         """Stream tokens for a single turn."""
@@ -643,6 +680,7 @@ class Session:
                 max_tokens=max_tokens,
                 **self._kv_kwargs(),
             ),
+            adaptive_growth=self._adaptive_growth,
         )
 
     def generate(self, prompt: str, max_tokens: int = 200) -> str:

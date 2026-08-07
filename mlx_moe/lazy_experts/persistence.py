@@ -236,6 +236,7 @@ def load_prepacked_weights(model, prepacked_path: str | Path,
                 mode=p2.mode,
                 proj_name=proj_name,
                 cache=pred_cache,
+                linear_bias=p2.get("bias"),
             )
             replacement.num_experts = pred_cache.num_experts
             setattr(switch, proj_name, replacement)

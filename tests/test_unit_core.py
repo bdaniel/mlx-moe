@@ -291,6 +291,14 @@ class TestFindSwitchMlp:
         assert found is switch
         assert prefix == "model.layers.0.block_sparse_moe.switch_mlp"
 
+    def test_gpt_oss_path(self):
+        experts = SimpleNamespace()
+        mlp = SimpleNamespace(experts=experts)
+        layer = SimpleNamespace(mlp=mlp)
+        found, prefix = _find_switch_mlp(layer, layer_idx=1)
+        assert found is experts
+        assert prefix == "model.layers.1.mlp.experts"
+
     def test_no_moe(self):
         layer = SimpleNamespace(mlp=SimpleNamespace())
         found, prefix = _find_switch_mlp(layer, layer_idx=5)
@@ -339,6 +347,11 @@ class TestFindMoeBlock:
         bsm = SimpleNamespace(switch_mlp=switch)
         layer = SimpleNamespace(block_sparse_moe=bsm)
         assert _find_moe_block(layer) is bsm
+
+    def test_gpt_oss_returns_mlp(self):
+        mlp = SimpleNamespace(experts=SimpleNamespace())
+        layer = SimpleNamespace(mlp=mlp)
+        assert _find_moe_block(layer) is mlp
 
     def test_none_for_non_moe(self):
         layer = SimpleNamespace(mlp=SimpleNamespace())

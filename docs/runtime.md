@@ -4,6 +4,16 @@
 
 This page covers predictive forward dispatch, skip-fallback behavior, and dynamic cache updates.
 
+## Faithful Forward Path
+
+Faithful mode evaluates router indices, loads every missing expert exactly, and
+never substitutes a cached fallback. First projection miss batches the same
+experts' up, gate, and down tensors behind one evaluation barrier. Telemetry
+reports bytes loaded, load time, calls, and cache hit rate.
+
+With adaptive growth enabled, exact cache capacity increases between tokens.
+Growth reserves slots only; future misses fill them, so outputs remain exact.
+
 ## Predictive Forward Path
 
 ```mermaid

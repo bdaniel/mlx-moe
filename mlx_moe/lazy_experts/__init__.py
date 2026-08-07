@@ -33,6 +33,8 @@ from .core import (
     dynamic_cache_update,
     dynamic_cache_update_ml,
     get_fallback_stats,
+    get_faithful_stats,
+    adaptive_faithful_capacity,
     measure_fallback,
     get_cache_stats,
     adaptive_capacity_upgrade,

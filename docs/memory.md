@@ -16,6 +16,18 @@ capacity = floor((target_gb - base_memory_gb) / slot_gb)
 
 `expert_slot_mb` includes `weight + scales + biases`.
 
+Faithful adaptive growth uses a stricter 60% target to preserve transient expert
+loading and KV headroom on 16 GB systems. It estimates bytes for one full
+expert slot from loaded tensors, includes unfilled reserved slots, then grows
+all active MoE-layer capacities uniformly by at most eight slots per token.
+Projected memory includes MLX allocator cache, avoiding repeated jumps based
+only on active tensors. Faithful startup caps allocator retention at 256 MB so
+evicted expert batches do not remain wired.
+
+Faithful generation defaults to 16-token prefill chunks. Large prompt chunks
+can route more unique experts than cache capacity and require all of them
+transiently for exact output; bounded chunks prevent that Metal-memory spike.
+
 ## Memory Control Flow
 
 ```mermaid

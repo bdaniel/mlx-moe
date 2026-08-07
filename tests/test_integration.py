@@ -333,7 +333,8 @@ class TestPredictiveForwardPass:
 
     def test_faithful_cache_miss_matches_stock(self, synthetic_model_dir):
         """Exact cache misses preserve output even when capacity is constrained."""
-        from mlx_moe.lazy_experts.core import enable_lazy_experts
+        from mlx_moe.lazy_experts.core import enable_lazy_experts, get_faithful_stats
+        from mlx_moe.lazy_experts.loading import SafetensorsMap, _build_shard_map
 
         model, model_path = synthetic_model_dir
         mx.random.seed(43)
@@ -344,12 +345,52 @@ class TestPredictiveForwardPass:
         mx.eval(stock_out)
 
         enable_lazy_experts(model, model_path, cache_capacity_per_layer=2)
+        shard_map = _build_shard_map(model_path)
+        st_map = SafetensorsMap(sorted(set(shard_map.values())))
+        for layer in model.layers:
+            switch = layer.mlp.switch_mlp
+            for proj_name in ("gate_proj", "up_proj", "down_proj"):
+                getattr(switch, proj_name)._st_map = st_map
         faithful_out = model.layers[0].mlp.switch_mlp(x, indices)
         mx.eval(faithful_out)
 
         np.testing.assert_allclose(
             np.array(faithful_out), np.array(stock_out), rtol=1e-4, atol=1e-5
         )
+        stats = get_faithful_stats(model)
+        assert stats["layers"] == NUM_LAYERS
+        assert stats["misses"] == 2
+        assert stats["hits"] == 4
+        assert stats["load_calls"] == 1
+        assert stats["experts_loaded"] == 6
+        assert stats["bytes_loaded"] > 0
+        assert stats["load_seconds"] > 0
+
+        repeat_out = model.layers[0].mlp.switch_mlp(x, indices)
+        mx.eval(repeat_out)
+        repeated = get_faithful_stats(model)
+        assert repeated["hits"] == 10
+        assert repeated["misses"] == 2
+        st_map.close()
+
+    def test_faithful_capacity_grows_without_loading(self, synthetic_model_dir):
+        from mlx_moe.lazy_experts.core import (
+            adaptive_faithful_capacity,
+            enable_lazy_experts,
+        )
+
+        model, model_path = synthetic_model_dir
+        enable_lazy_experts(model, model_path, cache_capacity_per_layer=2)
+        indices = mx.array([[1, 6]])
+        out = model.layers[0].mlp.switch_mlp(
+            mx.random.normal((1, 1, INPUT_DIMS)), indices
+        )
+        mx.eval(out)
+
+        growth = adaptive_faithful_capacity(model, grow_by=2)
+        assert growth["grown"] == 2
+        assert model.layers[0].mlp.switch_mlp.up_proj._cache.capacity == 4
+        assert len(model.layers[0].mlp.switch_mlp.up_proj._cache.entries) == 2
 
 
 class TestSkipFallbackForwardPass:
@@ -629,6 +670,56 @@ class TestServerEndpoints:
         text = "No thinking here."
         assert _strip_thinking(text) == "No thinking here."
 
+    def test_parse_nonstream_tool_calls(self):
+        from mlx_moe.server import _parse_nonstream_tool_calls
+
+        tokenizer = SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start="<tool>",
+            tool_call_end="</tool>",
+            tool_parser=lambda text, tools: {
+                "name": "read_file",
+                "arguments": {"path": "src/cache.py"},
+            },
+        )
+
+        calls = _parse_nonstream_tool_calls(
+            "<tool>ignored by fake parser</tool>", tokenizer, [{}]
+        )
+
+        assert len(calls) == 1
+        assert calls[0]["function"]["name"] == "read_file"
+        assert json.loads(calls[0]["function"]["arguments"]) == {
+            "path": "src/cache.py"
+        }
+
+    def test_parse_nonstream_tool_calls_ignores_plain_text(self):
+        from mlx_moe.server import _parse_nonstream_tool_calls
+
+        tokenizer = SimpleNamespace(
+            has_tool_calling=True,
+            tool_call_start="<tool>",
+            tool_call_end="</tool>",
+        )
+
+        assert _parse_nonstream_tool_calls("plain answer", tokenizer, [{}]) is None
+
+    def test_tokenize_messages_forwards_thinking(self, server):
+        captured = {}
+        server._tokenizer = SimpleNamespace(
+            has_chat_template=True,
+            has_tool_calling=False,
+            has_thinking=True,
+            apply_chat_template=lambda messages, **kwargs: captured.update(kwargs) or "prompt",
+        )
+
+        prompt = server._tokenize_messages(
+            [{"role": "user", "content": "think"}], enable_thinking=True
+        )
+
+        assert prompt == "prompt"
+        assert captured["enable_thinking"] is True
+
     def test_find_profile_uses_exact_model_slug(self, tmp_path):
         from mlx_moe.server import _find_profile
 
@@ -710,6 +801,20 @@ class TestServerEndpoints:
 
         assert captured["expert_policy"] == "faithful"
         assert srv._profile_path is None
+        assert srv._prefill_step_size == 16
+
+    def test_server_prefill_defaults_and_override(self):
+        from mlx_moe.server import Server
+
+        assert Server("test-model/fake")._prefill_step_size == 2048
+        assert (
+            Server(
+                "test-model/fake",
+                expert_policy="faithful",
+                prefill_step_size=32,
+            )._prefill_step_size
+            == 32
+        )
 
     def test_dynamic_update_policy_high_fallback_aggressive(self, server):
         interval, budget = server._dynamic_update_policy(

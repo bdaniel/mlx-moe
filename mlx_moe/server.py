@@ -139,6 +139,29 @@ def _strip_thinking(text: str) -> str:
     return _THINK_RE.sub("", text)
 
 
+def _parse_nonstream_tool_calls(text: str, tokenizer, tools: list | None):
+    if not tools or not tokenizer.has_tool_calling:
+        return None
+    start = tokenizer.tool_call_start
+    end = tokenizer.tool_call_end
+    if not start or start not in text:
+        return None
+    body = text.split(start, 1)[1]
+    if end and end in body:
+        body = body.split(end, 1)[0]
+    parsed = tokenizer.tool_parser(body, tools)
+    if not isinstance(parsed, list):
+        parsed = [parsed]
+    return [{
+        "id": call.pop("id", None) or f"call_{uuid.uuid4().hex[:12]}",
+        "type": "function",
+        "function": {
+            "name": call["name"],
+            "arguments": json.dumps(call["arguments"], ensure_ascii=False),
+        },
+    } for call in parsed]
+
+
 def _filter_thinking_piece(
     text: str,
     in_thinking: bool,
@@ -189,7 +212,8 @@ class Server:
                  warmup: str = "hybrid",
                  kv_cache_slots: int = 1,
                  adaptive_growth: bool = False,
-                 expert_policy: str = "approximate"):
+                 expert_policy: str = "approximate",
+                 prefill_step_size: int | None = None):
         if expert_policy not in {"approximate", "faithful"}:
             raise ValueError("expert_policy must be 'approximate' or 'faithful'")
         self._model_name = model_name
@@ -210,6 +234,11 @@ class Server:
         self._kv_cache = OrderedDict()
         self._adaptive_growth = adaptive_growth
         self._expert_policy = expert_policy
+        self._prefill_step_size = (
+            prefill_step_size
+            if prefill_step_size is not None
+            else (16 if expert_policy == "faithful" else 2048)
+        )
 
     def load(self):
         from .lazy_experts.generate import _startup
@@ -231,7 +260,10 @@ class Server:
 
     def _run_startup_refinement(self) -> None:
         import mlx_lm as _mlx_lm
-        from .lazy_experts.core import adaptive_cache_growth, dynamic_cache_update
+        from .lazy_experts.core import (
+            adaptive_cache_growth,
+            dynamic_cache_update,
+        )
 
         prompts = [
             "Write Python code that validates JSON input and returns structured errors.",
@@ -360,7 +392,12 @@ class Server:
         import mlx_lm as _mlx_lm
         from mlx_lm.sample_utils import make_sampler
         from mlx_lm.models import cache as cache_module
-        from .lazy_experts.core import adaptive_cache_growth, dynamic_cache_update
+        from .lazy_experts.core import (
+            adaptive_cache_growth,
+            adaptive_faithful_capacity,
+            dynamic_cache_update,
+            get_faithful_stats,
+        )
 
         # Find longest common prefix with cached KV from previous request
         prompt_cache = None
@@ -411,13 +448,16 @@ class Server:
         no_swap_streak = 0
         low_fallback_streak = 0
         last_window_fallback_rate = 1.0
+        faithful_before = get_faithful_stats(self._model)
         complete = False
 
         try:
             for resp in _mlx_lm.stream_generate(
                 self._model, self._tokenizer, prompt=mx.array(suffix),
                 max_tokens=max_tokens, sampler=make_sampler(**sampling),
-                prompt_cache=prompt_cache, **kv_kwargs,
+                prompt_cache=prompt_cache,
+                prefill_step_size=self._prefill_step_size,
+                **kv_kwargs,
             ):
                 if first_token_at is None:
                     first_token_at = time.perf_counter()
@@ -429,6 +469,9 @@ class Server:
                 yield resp
 
                 if self._expert_policy == "faithful":
+                    if self._adaptive_growth:
+                        growth = adaptive_faithful_capacity(self._model)
+                        dcu_grown += growth.get("grown", 0)
                     continue
 
                 interval, budget = self._dynamic_update_policy(
@@ -477,6 +520,30 @@ class Server:
                 prefill_ms = (prompt_len / prompt_tps * 1000.0) if prompt_tps > 0 else 0.0
                 ttft_ms = (first_token_at - request_t0) * 1000.0
                 fallback_rate = (dcu_fallbacks / dcu_requests) if dcu_requests > 0 else 0.0
+                faithful_after = get_faithful_stats(self._model)
+                faithful_requests = (
+                    faithful_after["requests"] - faithful_before["requests"]
+                )
+                faithful_hits = faithful_after["hits"] - faithful_before["hits"]
+                faithful_bytes = (
+                    faithful_after["bytes_loaded"] - faithful_before["bytes_loaded"]
+                )
+                faithful_load_s = (
+                    faithful_after["load_seconds"] - faithful_before["load_seconds"]
+                )
+                faithful_calls = (
+                    faithful_after["load_calls"] - faithful_before["load_calls"]
+                )
+                expert_detail = ""
+                if self._expert_policy == "faithful":
+                    hit_rate = (
+                        faithful_hits / faithful_requests if faithful_requests else 0.0
+                    )
+                    expert_detail = (
+                        f" expert_load={faithful_load_s * 1000:.1f}ms "
+                        f"expert_bytes={faithful_bytes / 1e6:.1f}MB "
+                        f"expert_calls={faithful_calls} hit_rate={hit_rate * 100:.2f}%"
+                    )
                 print(
                     f"  [telemetry] cache_key={cache_key} "
                     f"prefill={prefill_ms:.1f}ms ttft={ttft_ms:.1f}ms "
@@ -484,16 +551,22 @@ class Server:
                     f"expert_policy={self._expert_policy} "
                     f"dcu_calls={dcu_calls} swaps={dcu_swaps} "
                     f"fallback_rate={fallback_rate * 100:.2f}% grown={dcu_grown}"
+                    f"{expert_detail}"
                 )
 
-    def _tokenize_messages(self, messages: list, tools: list | None = None) -> str:
+    def _tokenize_messages(
+        self,
+        messages: list,
+        tools: list | None = None,
+        enable_thinking: bool = False,
+    ) -> str:
         tokenizer = self._tokenizer
         if tokenizer.has_chat_template:
             kwargs = {"add_generation_prompt": True, "tokenize": False}
             if tools and tokenizer.has_tool_calling:
                 kwargs["tools"] = tools
             if tokenizer.has_thinking:
-                kwargs["enable_thinking"] = False
+                kwargs["enable_thinking"] = enable_thinking
             return tokenizer.apply_chat_template(messages, **kwargs)
         parts = []
         for msg in messages:
@@ -531,11 +604,14 @@ class Server:
         max_tokens = min(raw if raw is not None else self._max_tokens, self._max_tokens)
         stream = body.get("stream", False)
         tools = body.get("tools")
+        enable_thinking = bool(body.get("enable_thinking", False))
         sampling = _sampling_kwargs(body, self._model_name)
         cache_key = self._cache_key_from_body(body)
 
         formatted = _format_messages(messages)
-        prompt = self._tokenize_messages(formatted, tools=tools)
+        prompt = self._tokenize_messages(
+            formatted, tools=tools, enable_thinking=enable_thinking
+        )
         prompt_tokens = self._encode_prompt(prompt)
         input_tokens = len(prompt_tokens)
 
@@ -559,14 +635,21 @@ class Server:
                 prompt_tokens, max_tokens, cache_key, **sampling
             )
 
+        tool_calls = _parse_nonstream_tool_calls(text, self._tokenizer, tools)
+        message = {"role": "assistant", "content": text if not tool_calls else ""}
+        finish_reason = "stop"
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+            finish_reason = "tool_calls"
+
         return JSONResponse({
             "id": _make_chatcmpl_id(),
             "object": "chat.completion",
             "model": self._model_id,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
+                "message": message,
+                "finish_reason": finish_reason,
             }],
             "usage": {
                 "prompt_tokens": input_tokens,
@@ -589,10 +672,13 @@ class Server:
         cache_key = self._cache_key_from_body(body)
 
         tools_anthropic = body.get("tools")
+        enable_thinking = bool(body.get("enable_thinking", False))
         tools_openai = _convert_tools_anthropic_to_openai(tools_anthropic) if tools_anthropic else None
 
         formatted = _format_messages(messages, system=system)
-        prompt = self._tokenize_messages(formatted, tools=tools_openai)
+        prompt = self._tokenize_messages(
+            formatted, tools=tools_openai, enable_thinking=enable_thinking
+        )
         prompt_tokens = self._encode_prompt(prompt)
         input_tokens = len(prompt_tokens)
 
@@ -972,7 +1058,8 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                kv_cache_slots: int = 1,
                shutdown_timeout: int = DEFAULT_SHUTDOWN_TIMEOUT,
                adaptive_growth: bool = False,
-               expert_policy: str = "approximate"):
+               expert_policy: str = "approximate",
+               prefill_step_size: int | None = None):
     import uvicorn
 
     server = Server(model_name, capacity=capacity, profile_path=profile_path,
@@ -981,7 +1068,8 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
                     kv_bits=kv_bits, warmup=warmup,
                     kv_cache_slots=kv_cache_slots,
                     adaptive_growth=adaptive_growth,
-                    expert_policy=expert_policy)
+                    expert_policy=expert_policy,
+                    prefill_step_size=prefill_step_size)
 
     print(f"mlx-moe serve")
     print(f"  Model:    {model_name}")
@@ -994,6 +1082,7 @@ def run_server(model_name: str, host: str = "127.0.0.1", port: int = 8080,
     print(f"  KV cache: {kv_cache_slots} slot(s)")
     print(f"  Adaptive growth: {'on' if adaptive_growth else 'off'}")
     print(f"  Expert policy: {expert_policy}")
+    print(f"  Prefill step: {server._prefill_step_size}")
     print(f"  Shutdown: {shutdown_timeout}s graceful timeout")
     if defaults:
         print(f"  Sampling: {defaults}")

@@ -22,7 +22,10 @@ def _run_gate(moe_block, x) -> mx.array:
       - Standard (Qwen, Mixtral): gate returns raw logits, we softmax + argpartition
       - GLM-style: gate returns (inds, scores) tuple directly
     """
-    result = moe_block.gate(x)
+    gate = getattr(moe_block, "gate", None)
+    if gate is None:
+        gate = moe_block.router
+    result = gate(x)
     if isinstance(result, tuple):
         inds, _ = result
         return inds
@@ -70,7 +73,7 @@ def router_only_forward(model, tokenizer, prompt: str,
 
     for i, layer in enumerate(model.layers):
         block = _find_moe_block(layer)
-        if block is not None and hasattr(block, "switch_mlp"):
+        if block is not None and _find_switch_mlp(layer)[0] is not None:
             moe_blocks[id(block)] = i
             collected[i] = set()
 
@@ -136,7 +139,7 @@ def router_only_discovery(model, tokenizer, prompt: str,
 
     for i, layer in enumerate(model.layers):
         block = _find_moe_block(layer)
-        if block is not None and hasattr(block, "switch_mlp"):
+        if block is not None and _find_switch_mlp(layer)[0] is not None:
             moe_blocks[id(block)] = i
             collected[i] = []
 
@@ -235,7 +238,7 @@ def speculative_router_probe(model, tokenizer, prompt: str,
     moe_blocks_map: dict[int, int] = {}  # id(block) -> layer_idx
     for i, layer in enumerate(model.layers):
         block = _find_moe_block(layer)
-        if block is not None and hasattr(block, "switch_mlp"):
+        if block is not None and _find_switch_mlp(layer)[0] is not None:
             moe_layer_indices.append(i)
             moe_blocks_map[id(block)] = i
 
@@ -315,7 +318,7 @@ def speculative_router_cross_layer(model, tokenizer, prompt: str,
     moe_blocks_map: dict[int, int] = {}  # id(block) -> layer_idx
     for i, layer in enumerate(model.layers):
         block = _find_moe_block(layer)
-        if block is not None and hasattr(block, "switch_mlp"):
+        if block is not None and _find_switch_mlp(layer)[0] is not None:
             moe_layer_indices.append(i)
             moe_blocks_map[id(block)] = i
 

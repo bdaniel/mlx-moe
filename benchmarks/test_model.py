@@ -78,6 +78,7 @@ def run_mlx_moe(
     from mlx_moe.lazy_experts.core import (
         adaptive_cache_growth,
         dynamic_cache_update,
+        get_faithful_stats,
         get_fallback_stats,
     )
     from mlx_moe.lazy_experts.loading import _find_switch_mlp, _detect_num_experts
@@ -131,6 +132,7 @@ def run_mlx_moe(
         print(f"\n--- Prompt {i+1}: {prompt_text[:50]}... ---")
 
         fb_before = get_fallback_stats(model)
+        faithful_before = get_faithful_stats(model)
         t0 = time.perf_counter()
         tokens = 0
         text = ""
@@ -186,13 +188,39 @@ def run_mlx_moe(
         mem_after = mx.get_active_memory() / 1e9
 
         fb_after = get_fallback_stats(model)
+        faithful_after = get_faithful_stats(model)
         fb_requests = fb_after["total_requests"] - fb_before["total_requests"]
         fb_fallbacks = fb_after["total_fallbacks"] - fb_before["total_fallbacks"]
         fallback_rate = fb_fallbacks / fb_requests if fb_requests else 0.0
+        faithful_requests = faithful_after["requests"] - faithful_before["requests"]
+        faithful_hits = faithful_after["hits"] - faithful_before["hits"]
+        faithful_stats = {
+            "requests": faithful_requests,
+            "hits": faithful_hits,
+            "misses": faithful_after["misses"] - faithful_before["misses"],
+            "hit_rate": faithful_hits / faithful_requests if faithful_requests else 0.0,
+            "load_calls": faithful_after["load_calls"] - faithful_before["load_calls"],
+            "experts_loaded": (
+                faithful_after["experts_loaded"] - faithful_before["experts_loaded"]
+            ),
+            "bytes_loaded": (
+                faithful_after["bytes_loaded"] - faithful_before["bytes_loaded"]
+            ),
+            "load_seconds": (
+                faithful_after["load_seconds"] - faithful_before["load_seconds"]
+            ),
+        }
 
         print(f"  {tokens} tokens, {tps:.1f} tok/s, {gen_time:.1f}s")
         print(f"  Memory: {mem_after:.1f} GB")
         print(f"  Fallback: {fallback_rate*100:.1f}% ({fb_fallbacks}/{fb_requests})")
+        if expert_policy == "faithful":
+            print(
+                f"  Exact loads: {faithful_stats['bytes_loaded'] / 1e6:.1f} MB, "
+                f"{faithful_stats['load_seconds']:.1f}s stall, "
+                f"{faithful_stats['load_calls']} calls, "
+                f"{faithful_stats['hit_rate'] * 100:.1f}% hits"
+            )
         headroom = (
             f", headroom={last_headroom_gb:.1f} GB"
             if last_headroom_gb is not None
@@ -211,6 +239,7 @@ def run_mlx_moe(
             "gen_time": gen_time,
             "memory_gb": mem_after,
             "fallback_rate": fallback_rate,
+            "faithful": faithful_stats,
             "dcu_calls": dcu_calls,
             "dcu_swaps": dcu_swaps,
             "dcu_fallback_rate": dcu_fallbacks / dcu_requests if dcu_requests else 0.0,

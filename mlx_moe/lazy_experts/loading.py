@@ -49,6 +49,7 @@ def _find_switch_mlp(layer, layer_idx=None, shard_map: dict[str, str] | None = N
 
     Supported paths:
       - layer.mlp.switch_mlp (Qwen, DeepSeek, GLM, Hunyuan, Jamba, OLMoE)
+      - layer.mlp.experts (GPT-OSS)
       - layer.block_sparse_moe.switch_mlp (Mixtral, PhiMoE, MiniMax, GraniteMoE)
     """
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp"):
@@ -57,6 +58,14 @@ def _find_switch_mlp(layer, layer_idx=None, shard_map: dict[str, str] | None = N
             key_base = _resolve_key_base(layer_idx, "mlp.switch_mlp", shard_map)
         else:
             key_base = "mlp.switch_mlp"
+        return switch, key_base
+
+    if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+        switch = layer.mlp.experts
+        if layer_idx is not None:
+            key_base = _resolve_key_base(layer_idx, "mlp.experts", shard_map)
+        else:
+            key_base = "mlp.experts"
         return switch, key_base
 
     if hasattr(layer, "block_sparse_moe") and hasattr(
@@ -77,10 +86,12 @@ def _find_switch_mlp(layer, layer_idx=None, shard_map: dict[str, str] | None = N
 def _find_moe_block(layer):
     """Find the MoE block in a layer (the parent of switch_mlp).
 
-    Returns the MoE block or None. Works for both Qwen (layer.mlp) and
+    Returns the MoE block or None. Works for Qwen/GPT-OSS (layer.mlp) and
     Mixtral (layer.block_sparse_moe) families.
     """
     if hasattr(layer, "mlp") and hasattr(layer.mlp, "switch_mlp"):
+        return layer.mlp
+    if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
         return layer.mlp
     if hasattr(layer, "block_sparse_moe") and hasattr(
         layer.block_sparse_moe, "switch_mlp"
