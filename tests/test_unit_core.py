@@ -4,7 +4,12 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 
-from mlx_moe.lazy_experts.modules import ExpertCache, PredictiveExpertCache
+from mlx_moe.lazy_experts.modules import (
+    ExpertCache,
+    PredictiveCachedSwitchLinear,
+    PredictiveExpertCache,
+)
+from mlx_moe.lazy_experts.core import adaptive_cache_growth
 from mlx_moe.lazy_experts.loading import (
     _find_switch_mlp,
     _find_moe_block,
@@ -219,6 +224,78 @@ class TestPredictiveExpertCache:
         pc._indices_buffer.append(mx.array([0, 1]))
         pc._indices_buffer.append(mx.array([2, 3]))
         assert len(pc._indices_buffer) == 2
+
+
+class TestAdaptiveCacheGrowth:
+
+    @staticmethod
+    def _model():
+        cache = PredictiveExpertCache(capacity=2, num_experts=8)
+        cache.build_lookup([0, 1])
+        cache.last_misses = {2, 3}
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            cache.weights[name] = mx.zeros((2, 64))
+            cache.scales[name] = mx.zeros((2, 8))
+            cache.biases[name] = None
+        proj = PredictiveCachedSwitchLinear(
+            group_size=64,
+            bits=4,
+            mode="affine",
+            proj_name="up_proj",
+            cache=cache,
+        )
+        switch = SimpleNamespace(up_proj=proj)
+        layer = SimpleNamespace(mlp=SimpleNamespace(switch_mlp=switch))
+        return SimpleNamespace(layers=[layer]), cache
+
+    def test_growth_skips_projected_transient_over_target(self, monkeypatch):
+        model, cache = self._model()
+        calls = []
+        monkeypatch.setattr(mx, "device_info", lambda: {
+            "max_recommended_working_set_size": 1000,
+        })
+        monkeypatch.setattr(mx, "get_active_memory", lambda: 700)
+        monkeypatch.setattr(mx, "get_cache_memory", lambda: 100)
+        monkeypatch.setattr(
+            PredictiveExpertCache,
+            "grow",
+            lambda self, ids: calls.append(ids) or len(ids),
+        )
+
+        result = adaptive_cache_growth(
+            model,
+            1.0,
+            min_headroom_gb=0,
+            target_fraction=1.0,
+        )
+
+        assert result["grown"] == 0
+        assert calls == []
+
+    def test_growth_runs_with_projected_transient_headroom(self, monkeypatch):
+        model, cache = self._model()
+        calls = []
+        monkeypatch.setattr(mx, "device_info", lambda: {
+            "max_recommended_working_set_size": 10_000,
+        })
+        monkeypatch.setattr(mx, "get_active_memory", lambda: 700)
+        monkeypatch.setattr(mx, "get_cache_memory", lambda: 100)
+        monkeypatch.setattr(
+            PredictiveExpertCache,
+            "grow",
+            lambda self, ids: calls.append(ids) or len(ids),
+        )
+
+        result = adaptive_cache_growth(
+            model,
+            1.0,
+            min_headroom_gb=0,
+            target_fraction=1.0,
+        )
+
+        assert result["grown"] == 2
+        assert result["layers"] == 1
+        assert calls == [[2, 3]]
 
 
 # ---------------------------------------------------------------------------

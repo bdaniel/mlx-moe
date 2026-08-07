@@ -601,6 +601,32 @@ def _free_percent() -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _memory_guard(
+    min_free_percent: int,
+    *,
+    attempts: int,
+    interval: float,
+    reclaim: bool,
+) -> dict:
+    readings = [_free_percent()]
+    first = readings[0]
+    if first is None or first >= min_free_percent:
+        return {"safe": True, "readings": readings, "reclaimed": False}
+
+    if reclaim:
+        gc.collect()
+        mx.clear_cache()
+
+    for _ in range(1, attempts):
+        if interval:
+            time.sleep(interval)
+        readings.append(_free_percent())
+        if readings[-1] is None or readings[-1] >= min_free_percent:
+            return {"safe": True, "readings": readings, "reclaimed": reclaim}
+
+    return {"safe": False, "readings": readings, "reclaimed": reclaim}
+
+
 def _retrieved_context(root: Path, query: str, max_chars: int) -> str:
     terms = set(re.findall(r"[a-z_][a-z0-9_]{3,}", query.lower()))
     candidates = []
@@ -800,11 +826,22 @@ def _run_scenario(
         {"role": "system", "content": SYSTEM},
         {"role": "user", "content": initial_content},
     ]
+    memory_checks = []
     started = time.perf_counter()
     for turn in range(1, args.max_turns + 1):
-        free = _free_percent()
-        if free is not None and free < args.min_free_percent:
-            transcript.append({"turn": turn, "error": f"memory guard: {free}% free"})
+        memory_check = _memory_guard(
+            args.min_free_percent,
+            attempts=args.memory_guard_checks,
+            interval=args.memory_guard_interval,
+            reclaim=model is not None,
+        )
+        memory_checks.append({"turn": turn, **memory_check})
+        if not memory_check["safe"]:
+            readings = ", ".join(f"{value}%" for value in memory_check["readings"])
+            transcript.append({
+                "turn": turn,
+                "error": f"memory guard: sustained low memory ({readings})",
+            })
             break
         history_size = args.history_turns * 2
         prompt_messages = (
@@ -960,6 +997,7 @@ def _run_scenario(
         "active_memory_gb": mx.get_active_memory() / 1e9 if model is not None else 0.0,
         "peak_memory_gb": mx.get_peak_memory() / 1e9 if model is not None else 0.0,
         "free_percent_after": _free_percent(),
+        "memory_checks": memory_checks,
         "public_test_output": public["output"],
         "hidden_test_output": hidden_output,
         "planner": planner,
@@ -1015,6 +1053,8 @@ def main() -> int:
     parser.add_argument("--kv-bits", type=int, choices=(4, 8), default=8)
     parser.add_argument("--prefill-step-size", type=int, default=512)
     parser.add_argument("--min-free-percent", type=int, default=15)
+    parser.add_argument("--memory-guard-checks", type=int, default=3)
+    parser.add_argument("--memory-guard-interval", type=float, default=0.5)
     parser.add_argument("--max-invalid-actions", type=int, default=3)
     parser.add_argument("--max-duplicate-actions", type=int, default=4)
     parser.add_argument("--context-mode", choices=("tools", "hybrid"), default="tools")

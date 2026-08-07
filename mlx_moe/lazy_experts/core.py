@@ -757,15 +757,18 @@ def adaptive_cache_growth(
     min_headroom_gb: float = 1.0,
     grow_by: int = 8,
     max_layer_growths: int = 16,
+    target_fraction: float = 0.75,
 ) -> dict:
     """Append cache slots for recently missed experts when memory allows."""
     if fallback_rate < min_fallback_rate:
         return {"grown": 0, "layers": 0, "headroom_gb": None}
 
     info = mx.device_info()
-    recommended_gb = info["max_recommended_working_set_size"] / 1e9
-    active_gb = mx.get_active_memory() / 1e9
-    headroom_gb = recommended_gb - active_gb
+    target_bytes = int(
+        info["max_recommended_working_set_size"] * target_fraction
+    )
+    projected_bytes = mx.get_active_memory() + mx.get_cache_memory()
+    headroom_gb = (target_bytes - projected_bytes) / 1e9
     if headroom_gb < min_headroom_gb:
         return {"grown": 0, "layers": 0, "headroom_gb": headroom_gb}
 
@@ -796,6 +799,32 @@ def adaptive_cache_growth(
     grown = 0
     layers = 0
     for _, _, cache, expert_ids in sorted(candidates, reverse=True)[:max_layer_growths]:
+        cached = max(1, len(cache.cached_ids))
+        permanent_bytes = 0
+        transient_bytes = 0
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            tensors = (
+                cache.weights.get(proj_name),
+                cache.scales.get(proj_name),
+                cache.biases.get(proj_name),
+            )
+            current_bytes = sum(
+                tensor.nbytes for tensor in tensors if tensor is not None
+            )
+            added_bytes = current_bytes * len(expert_ids) // cached
+            permanent_bytes += added_bytes
+            transient_bytes = max(
+                transient_bytes,
+                current_bytes + added_bytes,
+            )
+        projected_peak = (
+            mx.get_active_memory()
+            + mx.get_cache_memory()
+            + permanent_bytes
+            + transient_bytes
+        )
+        if projected_peak > target_bytes:
+            continue
         added = cache.grow(expert_ids)
         if added:
             grown += added
