@@ -14,6 +14,46 @@ PROMPT = (
 )
 
 
+def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens):
+    from mlx_lm.models.cache import make_prompt_cache
+
+    add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
+        tokenizer.bos_token
+    )
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+    cache = make_prompt_cache(model)
+    start = time.perf_counter()
+    for offset in range(0, len(prompt_ids), step_size):
+        chunk = prompt_ids[offset:offset + step_size]
+        print(f"  Synchronous prefill: {offset + len(chunk)}/{len(prompt_ids)} tokens", flush=True)
+        logits = model(mx.array([chunk]), cache=cache)[:, -1, :]
+        # Evaluating the output keeps the ring collectives in the prefill graph.
+        mx.eval(logits, [entry.state for entry in cache])
+
+    token_ids = [mx.argmax(logits, axis=-1).item()]
+    first = time.perf_counter()
+    while len(token_ids) < max_tokens and token_ids[-1] not in tokenizer.eos_token_ids:
+        logits = model(mx.array([[token_ids[-1]]]), cache=cache)[:, -1, :]
+        token = mx.argmax(logits, axis=-1)
+        mx.eval(token, [entry.state for entry in cache])
+        token_ids.append(token.item())
+
+    end = time.perf_counter()
+    stopped = token_ids[-1] in tokenizer.eos_token_ids
+    return {
+        "ttft_s": first - start,
+        "elapsed_s": end - start,
+        "prompt_tokens": len(prompt_ids),
+        "generation_tokens": len(token_ids),
+        "prefill_tps": len(prompt_ids) / (first - start),
+        "decode_tps": (len(token_ids) - 1) / (end - first),
+        "peak_bytes": mx.get_peak_memory(),
+        "finish_reason": "stop" if stopped else "length",
+        "token_ids": token_ids,
+        "text": tokenizer.decode(token_ids[:-1] if stopped else token_ids),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("faithful", "pipeline"))
@@ -23,7 +63,11 @@ def main():
     parser.add_argument("--prefill-step-size", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=32)
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--pipeline-synchronous", action="store_true",
+                        help="Evaluate model outputs and cache state together for each pipeline step.")
     args = parser.parse_args()
+    if args.pipeline_synchronous and args.mode != "pipeline":
+        parser.error("--pipeline-synchronous requires pipeline mode")
     if min(args.tokens, args.prefill_step_size, args.capacity, args.repeat) < 1:
         parser.error("tokens, prefill step size, capacity and repeat must be positive")
     model_path = args.model.expanduser().resolve()
@@ -68,6 +112,8 @@ def main():
         "max_tokens": args.tokens,
         "capacity": args.capacity if args.mode == "faithful" else None,
     }
+    if args.pipeline_synchronous:
+        context["pipeline_synchronous"] = True
     loaded = {
         **context,
         "event": "loaded",
@@ -86,6 +132,12 @@ def main():
     sampler = make_sampler(temp=0.0)
     for trial in range(1, args.repeat + 1):
         mx.reset_peak_memory()
+        if args.pipeline_synchronous:
+            result = run_synchronous_pipeline(
+                mx, model, tokenizer, formatted, args.prefill_step_size, args.tokens
+            )
+            print(json.dumps({**context, "event": "trial", "trial": trial, **result}), flush=True)
+            continue
         before = get_faithful_stats(model) if args.mode == "faithful" else None
         token_ids = []
         text = []

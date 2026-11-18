@@ -4,6 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 python_bin="${1:-.venv/bin/python}"
+if ! command -v "$python_bin" >/dev/null; then
+    printf 'Python executable unavailable: %s\n' "$python_bin" >&2
+    if [[ $# -eq 0 ]]; then
+        printf 'Run `uv sync` from %s to create the project environment.\n' "$PWD" >&2
+        printf 'You can also pass the absolute path to an existing benchmark Python.\n' >&2
+    fi
+    exit 1
+fi
 models="$HOME/.lmstudio/models"
 "$python_bin" benchmarks/check_metal.py
 
