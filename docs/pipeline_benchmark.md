@@ -62,6 +62,16 @@ This is a diagnostic run. If it completes on both ranks, keep the 4-token prefil
 
 If prefill still times out, retry with `--pipeline-synchronous` on both ranks. This evaluates model output and cache state together and prints progress before each prefill chunk. It records its timing in the same JSON format with `pipeline_synchronous: true`.
 
+If the first synchronous prefill step times out, stop both ranks and isolate the GPU activation handoff without loading a model. Run this on each Mac with the same rank and hostfile settings.
+
+```zsh
+unset MLX_METAL_FAST_SYNCH
+.venv-pipeline/bin/python benchmarks/check_metal.py &&
+MLX_RING_VERBOSE=1 .venv-pipeline/bin/python -u benchmarks/check_mlx_ring.py --gpu
+```
+
+Both ranks should report `GPU activation handoff OK`. If only the scalar ring test succeeds, the failure also occurs without Qwen weights or caches. If the activation test succeeds, the next diagnostic is a smaller sharded checkpoint or an isolated Qwen stage.
+
 Use the launcher below if you prefer to start both ranks from one terminal over SSH.
 
 Launch both ranks from the mini. With `127.0.0.1` in the `ssh` field, the launcher starts the mini rank locally. The `ips` field still uses the mini's Ethernet address for MLX traffic. Only the mini needs to initiate an SSH login, and both Macs need to exchange MLX ring traffic.
