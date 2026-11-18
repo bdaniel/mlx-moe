@@ -306,11 +306,16 @@ def _normalize_action(value: dict) -> dict:
 
 
 def _gpt_oss_action(text: str) -> dict | None:
+    payload = (
+        r"(?:\s+(?:code|json))?"
+        r"(?:<\|channel\|>(?:commentary|analysis)(?:\s+(?:code|json))?)?"
+        r"(?:\s*<\|constrain\|>[^<]*)*<\|message\|>"
+        r"(.*?)(?:<\|call\|>|$)"
+    )
     patterns = (
-        r"assistant to=functions\.([A-Za-z_][A-Za-z0-9_]*)"
-        r"<\|channel\|>commentary(?: [^<]*)?<\|message\|>(.*?)(?:<\|call\|>|$)",
-        r"<\|channel\|>(?:commentary|analysis) to=functions\.([A-Za-z_][A-Za-z0-9_]*)"
-        r"(?:\s*<\|constrain\|>[^<]*)*<\|message\|>(.*?)(?:<\|call\|>|$)",
+        r"to=functions\.([A-Za-z_][A-Za-z0-9_]*)" + payload,
+        r"<\|channel\|>functions\.([A-Za-z_][A-Za-z0-9_]*)" + payload,
+        r"to=functions\.([A-Za-z_][A-Za-z0-9_]*)>:\s*(.*)$",
     )
     for pattern in patterns:
         match = re.search(pattern, text, re.DOTALL)
@@ -320,21 +325,38 @@ def _gpt_oss_action(text: str) -> dict | None:
     return None
 
 
+def _gpt_oss_final(text: str) -> str | None:
+    message_pattern = (
+        r"<\|channel\|>final"
+        r"(?:(?:\s*<\|(?:constrain|channel)\|>)[^<]*)*"
+        r"<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|$)"
+    )
+    matches = re.findall(message_pattern, text, re.DOTALL)
+    if matches:
+        return matches[-1].strip()
+    direct = re.search(
+        r"<\|channel\|>final\s*<\|constrain\|>(?:json)?\s*(\{.*\})\s*$",
+        text,
+        re.DOTALL,
+    )
+    if direct is None:
+        return None
+    content = direct.group(1).strip()
+    value = _json_value(content)
+    return str(value.get("summary", content))
+
+
 def _assistant_history(text: str) -> dict:
     thinking_matches = re.findall(
         r"<\|channel\|>analysis<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|$)",
         text,
         re.DOTALL,
     )
-    final_matches = re.findall(
-        r"<\|channel\|>final<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|$)",
-        text,
-        re.DOTALL,
-    )
-    message = {"role": "assistant", "content": final_matches[-1] if final_matches else ""}
+    final = _gpt_oss_final(text)
+    message = {"role": "assistant", "content": final or ""}
     if thinking_matches:
         message["thinking"] = thinking_matches[-1]
-    elif not final_matches:
+    elif final is None:
         message["content"] = text
     return message
 
@@ -342,13 +364,8 @@ def _assistant_history(text: str) -> dict:
 def _action_value(tokenizer, text: str) -> dict:
     if action := _gpt_oss_action(text):
         return action
-    final = re.search(
-        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|return\|>|<\|end\|>|$)",
-        text,
-        re.DOTALL,
-    )
-    if final is not None:
-        return {"action": "finish", "summary": final.group(1).strip()}
+    if (final := _gpt_oss_final(text)) is not None:
+        return {"action": "finish", "summary": final}
     start = tokenizer.tool_call_start
     end = tokenizer.tool_call_end
     if start and end and start in text:
