@@ -72,6 +72,49 @@ MLX_RING_VERBOSE=1 .venv-pipeline/bin/python -u benchmarks/check_mlx_ring.py --g
 
 Both ranks should report `GPU activation handoff OK`. If only the scalar ring test succeeds, the failure also occurs without Qwen weights or caches. If the activation test succeeds, the next diagnostic is a smaller sharded checkpoint or an isolated Qwen stage.
 
+To test the LM Studio Qwen 3.5 0.8B MLX checkpoint, run this on both Macs with the same rank and hostfile settings:
+
+```zsh
+.venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+  pipeline "$HOME/.lmstudio/models/lmstudio-community/Qwen3.5-0.8B-MLX-4bit" \
+  --pipeline-synchronous --prefill-step-size 4 --tokens 8 --repeat 1
+```
+
+If the smaller model completes but the 35B model times out during prefill, run this on both Macs to time each loaded 35B shard locally:
+
+```zsh
+.venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+  pipeline "$HOME/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit" \
+  --pipeline-stage-only --prefill-step-size 4
+```
+
+Both ranks participate in sharded loading. Each then runs its own layers with local token embeddings as input. Compare `forward_s`, the layer ranges, and peak allocation in the `stage_probe` records.
+
+If both local forwards finish but the distributed 35B forward times out, try the host-synchronized mode on both Macs. It completes the upstream GPU computation before sending activations and completes the TCP receive before submitting work to the downstream GPU.
+
+```zsh
+unset MLX_METAL_FAST_SYNCH
+.venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+  pipeline "$HOME/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit" \
+  --pipeline-host-sync --prefill-step-size 4 --tokens 8 --repeat 1
+```
+
+## Benchmark distinct coding prompts
+
+After the short host-synchronized trial completes, run this on both Macs with the same rank and hostfile settings. Use the same benchmark script and prompt suite on both ranks.
+
+```zsh
+model="$HOME/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit"
+set -o pipefail
+mkdir -p logs/pipeline-baseline
+.venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+  pipeline "$model" --pipeline-host-sync --prefill-step-size 4 \
+  --prompt-suite benchmarks/pipeline_coding_prompts.json --tokens 128 --repeat 1 2>&1 \
+  | tee "logs/pipeline-baseline/coding-rank-${MLX_RANK}-$(date -u +%Y%m%dT%H%M%SZ).log"
+```
+
+Each rank loads once and runs the three coding prompts in file order. Each prompt starts with a fresh generation cache. Compare the rank-zero time to first token and decode rate by `prompt_name`, and check that both ranks produced identical token IDs for each prompt. The first prompt also includes any one-time GPU work after loading.
+
 Use the launcher below if you prefer to start both ranks from one terminal over SSH.
 
 Launch both ranks from the mini. With `127.0.0.1` in the `ssh` field, the launcher starts the mini rank locally. The `ips` field still uses the mini's Ethernet address for MLX traffic. Only the mini needs to initiate an SSH login, and both Macs need to exchange MLX ring traffic.
