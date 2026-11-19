@@ -1,4 +1,4 @@
-"""Compare single-host and pipelined generation with resident or SSD weights."""
+"""Compare single-host, pipeline-parallel, and tensor-parallel generation."""
 
 import argparse
 import importlib.metadata
@@ -53,7 +53,7 @@ def run_local_pipeline_stage(mx, model, prompt_ids):
     }
 
 
-def host_synchronized_step(mx, model, group):
+def host_synchronized_step(mx, model, group, timings):
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     stage = model.model
@@ -62,6 +62,7 @@ def host_synchronized_step(mx, model, group):
     stage.pipeline_size = 1
 
     def step(inputs, cache, sample):
+        started = time.perf_counter()
         hidden = stage.embed_tokens(inputs)
         if rank == 1:
             fa_mask = (
@@ -76,24 +77,34 @@ def host_synchronized_step(mx, model, group):
                 hidden = layer(hidden, mask=ssm_mask if layer.is_linear else fa_mask, cache=entry)
             # Materialize the GPU result before scheduling the TCP send.
             mx.eval(hidden, [entry.state for entry in cache])
+            forward_done = time.perf_counter()
             mx.eval(mx.distributed.send(hidden, 0, group=group, stream=mx.cpu))
+            timings["local_forward_s"] += forward_done - started
+            timings["activation_handoff_s"] += time.perf_counter() - forward_done
             token_id = 0
         else:
             hidden = mx.distributed.recv_like(hidden, 1, group=group, stream=mx.cpu)
             # Wait on the host before submitting the downstream GPU commands.
             mx.eval(hidden)
+            activation_ready = time.perf_counter()
             logits = model(inputs, cache=cache, input_embeddings=hidden)[:, -1, :]
             output = mx.argmax(logits, axis=-1) if sample else logits
             mx.eval(output, [entry.state for entry in cache])
             token_id = output.item() if sample else 0
+            timings["activation_handoff_s"] += activation_ready - started
+            timings["local_forward_s"] += time.perf_counter() - activation_ready
 
         if sample:
-            return mx.distributed.all_sum(mx.array(token_id), group=group, stream=mx.cpu).item()
+            started = time.perf_counter()
+            token_id = mx.distributed.all_sum(mx.array(token_id), group=group, stream=mx.cpu).item()
+            timings["token_sync_s"] += time.perf_counter() - started
+            return token_id
 
     return step
 
 
-def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens, step=None):
+def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens,
+                             step=None, timings=None):
     from mlx_lm.models.cache import make_prompt_cache
 
     if step is None:
@@ -114,12 +125,13 @@ def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens
 
     token_ids = [token_id]
     first = time.perf_counter()
+    prefill_timings = timings.copy() if timings is not None else None
     while len(token_ids) < max_tokens and token_ids[-1] not in tokenizer.eos_token_ids:
         token_ids.append(step(mx.array([[token_ids[-1]]]), cache, True))
 
     end = time.perf_counter()
     stopped = token_ids[-1] in tokenizer.eos_token_ids
-    return {
+    result = {
         "ttft_s": first - start,
         "elapsed_s": end - start,
         "prompt_tokens": len(prompt_ids),
@@ -131,11 +143,17 @@ def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens
         "token_ids": token_ids,
         "text": tokenizer.decode(token_ids[:-1] if stopped else token_ids),
     }
+    if prefill_timings is not None:
+        result["pipeline_timings"] = {
+            "prefill": prefill_timings,
+            "decode": {key: value - prefill_timings[key] for key, value in timings.items()},
+        }
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("resident", "faithful", "pipeline", "pipeline-ssd"))
+    parser.add_argument("mode", choices=("resident", "faithful", "pipeline", "pipeline-ssd", "tensor"))
     parser.add_argument("model", type=Path)
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument("--prompt-file", type=Path)
@@ -144,7 +162,17 @@ def main():
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--prefill-step-size", type=int, default=16)
     parser.add_argument("--capacity", type=int, default=32)
+    parser.add_argument(
+        "--pipeline-split", type=int, nargs=2, metavar=("RANK0", "RANK1"),
+        help="Number of layers per rank in pipeline-ssd mode. Rank 0 gets the last layers.",
+    )
+    parser.add_argument(
+        "--pipeline-hot-experts", type=int, metavar="N",
+        help="Pack up to N exact experts per layer after the first pipeline-ssd pass.",
+    )
     parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "high"),
+                        help="Set GPT-OSS reasoning effort in the chat template.")
     diagnostics = parser.add_mutually_exclusive_group()
     diagnostics.add_argument("--pipeline-synchronous", action="store_true",
                              help="Evaluate model outputs and cache state together for each pipeline step.")
@@ -155,17 +183,36 @@ def main():
     args = parser.parse_args()
     if (args.pipeline_synchronous or args.pipeline_stage_only or args.pipeline_host_sync) and args.mode != "pipeline":
         parser.error("pipeline diagnostics require pipeline mode")
+    if args.pipeline_split is not None and args.mode != "pipeline-ssd":
+        parser.error("--pipeline-split requires pipeline-ssd mode")
+    if args.pipeline_hot_experts is not None:
+        if args.mode != "pipeline-ssd" or args.repeat < 2:
+            parser.error("--pipeline-hot-experts requires pipeline-ssd mode and at least two passes")
+        if args.pipeline_hot_experts < 1:
+            parser.error("--pipeline-hot-experts must be positive")
     if args.pipeline_stage_only and args.prompt_suite is not None:
         parser.error("--pipeline-stage-only takes a single prompt")
     if min(args.tokens, args.prefill_step_size, args.capacity, args.repeat) < 1:
         parser.error("tokens, prefill step size, capacity and repeat must be positive")
     model_path = args.model.expanduser().resolve()
-    if not (model_path / "config.json").is_file():
+    config_path = model_path / "config.json"
+    if not config_path.is_file():
         parser.error(f"missing checkpoint config under {model_path}")
     try:
         prompts = load_prompts(args)
+        model_config = json.loads(config_path.read_text())
+        model_type = model_config.get("model_type")
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
+    if args.reasoning_effort is not None and model_type != "gpt_oss":
+        parser.error("--reasoning-effort requires a GPT-OSS checkpoint")
+    if args.pipeline_hot_experts is not None:
+        if model_type != "qwen3_5_moe":
+            parser.error("--pipeline-hot-experts requires a Qwen 3.5 MoE checkpoint")
+        top_k = model_config.get("text_config", model_config)["num_experts_per_tok"]
+        # Leave enough cache slots for every routed expert in a full prefill chunk.
+        if args.pipeline_hot_experts + top_k * args.prefill_step_size > args.capacity:
+            parser.error("--capacity must cover packed experts plus prefill-step-size × experts per token")
 
     import mlx.core as mx
     from mlx_lm import stream_generate
@@ -180,19 +227,27 @@ def main():
     rank = 0
     mx.reset_peak_memory()
     startup = time.perf_counter()
-    if pipeline:
+    if pipeline or args.mode == "tensor":
         group = mx.distributed.init(backend="ring", strict=True)
         if group.size() != 2:
-            parser.error("pipeline mode requires two MLX ring ranks")
+            parser.error("distributed mode requires two MLX ring ranks")
         rank = group.rank()
         if expert_streaming:
-            from mlx_moe.lazy_experts.pipeline import load_faithful_pipeline_stage
+            from mlx_moe.lazy_experts.pipeline import (
+                load_faithful_pipeline_stage,
+                pack_pipeline_hot_experts,
+            )
 
-            model, tokenizer = load_faithful_pipeline_stage(model_path, group, args.capacity)
+            model, tokenizer = load_faithful_pipeline_stage(
+                model_path, group, args.capacity, split=args.pipeline_split
+            )
         else:
             from mlx_lm.utils import sharded_load
 
-            model, tokenizer = sharded_load(str(model_path), pipeline_group=group)
+            if pipeline:
+                model, tokenizer = sharded_load(str(model_path), pipeline_group=group)
+            else:
+                model, tokenizer = sharded_load(str(model_path), tensor_group=group)
     elif expert_streaming:
         from mlx_moe.lazy_experts.generate import _startup
 
@@ -219,6 +274,11 @@ def main():
         "max_tokens": args.tokens,
         "capacity": args.capacity if expert_streaming else None,
     }
+    chat_options = {}
+    if model_type == "gpt_oss":
+        context["reasoning_effort"] = args.reasoning_effort or "medium"
+        if args.reasoning_effort is not None:
+            chat_options["reasoning_effort"] = args.reasoning_effort
     if args.pipeline_synchronous:
         context["pipeline_synchronous"] = True
     if host_sync:
@@ -226,6 +286,8 @@ def main():
     if args.mode == "pipeline-ssd":
         context["layers_start"] = model.model.start_idx
         context["layers_end_exclusive"] = model.model.end_idx
+    if args.pipeline_hot_experts is not None:
+        context["pipeline_hot_experts"] = args.pipeline_hot_experts
     loaded = {
         **context,
         "event": "loaded",
@@ -241,15 +303,13 @@ def main():
             tokenize=False,
             add_generation_prompt=True,
             enable_thinking=False,
+            **chat_options,
         ))
         for name, prompt in prompts.items()
     ]
-    step = None
     if args.pipeline_stage_only or host_sync:
         if model.model_type not in {"qwen3_5", "qwen3_5_moe"}:
             parser.error("this diagnostic requires a Qwen 3.5 model")
-    if host_sync:
-        step = host_synchronized_step(mx, model, group)
     if args.pipeline_stage_only:
         _, formatted = formatted_prompts[0]
         prompt_ids = encode_prompt(tokenizer, formatted)[:args.prefill_step_size]
@@ -261,13 +321,27 @@ def main():
     sampler = make_sampler(temp=0.0)
     for trial, (name, formatted) in enumerate(formatted_prompts * args.repeat, start=1):
         mx.reset_peak_memory()
+        if args.pipeline_hot_experts is not None and trial == len(formatted_prompts) + 1:
+            pack_start = time.perf_counter()
+            packed = pack_pipeline_hot_experts(model, args.pipeline_hot_experts)
+            pack_seconds = time.perf_counter() - pack_start
+            mx.eval(mx.distributed.all_sum(mx.array(1), group=group, stream=mx.cpu))
+            print(json.dumps({
+                **context, "event": "packed", "experts": packed, "seconds": pack_seconds,
+                "peak_bytes": mx.get_peak_memory(),
+            }), flush=True)
+            mx.reset_peak_memory()
         trial_context = {**context, "event": "trial", "trial": trial, "prompt_name": name}
         if args.prompt_suite is not None:
             print(f"  Trial {trial}: {name}", flush=True)
         before = get_faithful_stats(model) if expert_streaming else None
         if args.pipeline_synchronous or host_sync:
+            timings = step = None
+            if host_sync:
+                timings = dict.fromkeys(("local_forward_s", "activation_handoff_s", "token_sync_s"), 0.0)
+                step = host_synchronized_step(mx, model, group, timings)
             result = run_synchronous_pipeline(
-                mx, model, tokenizer, formatted, args.prefill_step_size, args.tokens, step
+                mx, model, tokenizer, formatted, args.prefill_step_size, args.tokens, step, timings
             )
         else:
             result = run_streaming_trial(
@@ -283,6 +357,8 @@ def main():
                 experts["bytes_loaded"] / result["generation_tokens"]
             )
             experts["load_time_fraction"] = experts["load_seconds"] / result["elapsed_s"]
+            if args.pipeline_hot_experts is not None:
+                experts["packed_dispatches"] = after["packed_dispatches"] - before["packed_dispatches"]
             result["experts"] = experts
         print(json.dumps({**trial_context, **result}), flush=True)
 
@@ -290,6 +366,16 @@ def main():
 def run_streaming_trial(mx, model, tokenizer, prompt, args, sampler, stream_generate):
     token_ids = []
     text = []
+    final_header = []
+    if getattr(model, "model_type", None) == "gpt_oss":
+        final_header = tokenizer.encode("<|channel|>final<|message|>", add_special_tokens=False)
+        control_tokens = set(tokenizer.eos_token_ids)
+        for marker in ("<|start|>", "<|end|>", "<|return|>", "<|call|>", "<|channel|>", "<|message|>"):
+            control_tokens.update(tokenizer.encode(marker, add_special_tokens=False))
+    in_final = False
+    first_final = None
+    final_tokens = 0
+
     start = time.perf_counter()
     for response in stream_generate(
         model,
@@ -299,12 +385,21 @@ def run_streaming_trial(mx, model, tokenizer, prompt, args, sampler, stream_gene
         sampler=sampler,
         prefill_step_size=args.prefill_step_size,
     ):
+        token = int(response.token)
         if not token_ids:
             first = time.perf_counter()
-        token_ids.append(int(response.token))
+        token_ids.append(token)
         text.append(response.text)
+        if final_header:
+            # Follow token IDs because the detokenizer can buffer text across yields.
+            if token in control_tokens:
+                in_final = token_ids[-len(final_header):] == final_header
+            elif in_final:
+                if first_final is None:
+                    first_final = time.perf_counter()
+                final_tokens += 1
     elapsed = time.perf_counter() - start
-    return {
+    result = {
         "ttft_s": first - start,
         "elapsed_s": elapsed,
         "prompt_tokens": response.prompt_tokens,
@@ -316,6 +411,10 @@ def run_streaming_trial(mx, model, tokenizer, prompt, args, sampler, stream_gene
         "token_ids": token_ids,
         "text": "".join(text),
     }
+    if final_header:
+        result["ttft_final_s"] = first_final - start if first_final is not None else None
+        result["final_answer_tokens"] = final_tokens
+    return result
 
 
 if __name__ == "__main__":

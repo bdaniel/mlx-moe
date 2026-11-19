@@ -680,6 +680,7 @@ def get_faithful_stats(model) -> dict:
         "misses": misses,
         "hit_rate": hits / requests if requests else 0.0,
         "load_calls": sum(cache.load_calls for cache in caches.values()),
+        "packed_dispatches": sum(cache.packed_dispatches for cache in caches.values()),
         "experts_loaded": sum(cache.experts_loaded for cache in caches.values()),
         "bytes_loaded": sum(cache.bytes_loaded for cache in caches.values()),
         "load_seconds": sum(cache.load_seconds for cache in caches.values()),

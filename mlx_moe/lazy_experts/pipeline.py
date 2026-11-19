@@ -10,7 +10,9 @@ from .generate import _WARMUP_CACHE, _load_model_and_tokenizer
 from .loading import SafetensorsMap, _build_shard_map, _find_switch_mlp
 
 
-def load_faithful_pipeline_stage(model_path: Path, group, capacity: int):
+def load_faithful_pipeline_stage(
+    model_path: Path, group, capacity: int, *, split: list[int] | None = None
+):
     config = json.loads((model_path / "config.json").read_text())
     if config.get("model_type") != "qwen3_5_moe":
         raise ValueError("SSD pipeline requires a quantized Qwen 3.5 MoE checkpoint")
@@ -23,7 +25,7 @@ def load_faithful_pipeline_stage(model_path: Path, group, capacity: int):
     model, tokenizer, _ = _load_model_and_tokenizer(str(model_path), lazy=True)
     stage = model.model
     # Discard the other rank's layers and replace this rank's experts before eval.
-    stage.pipeline(group)
+    stage.pipeline(group, split=split)
     replaced = _enable_cached(model, shard_map, capacity, layer_offset=stage.start_idx)
     if replaced != len(model.layers) * 3:
         raise ValueError("SSD pipeline requires three quantized expert projections per layer")
@@ -51,3 +53,11 @@ def load_faithful_pipeline_stage(model_path: Path, group, capacity: int):
     mx.eval(model.parameters())
     mx.eval(mx.distributed.all_sum(mx.array(1), group=group, stream=mx.cpu))
     return model, tokenizer
+
+
+def pack_pipeline_hot_experts(model, count: int) -> int:
+    packed = 0
+    for layer in model.layers:
+        switch, _ = _find_switch_mlp(layer)
+        packed += switch.up_proj._cache.pack_hot_experts(count)
+    return packed

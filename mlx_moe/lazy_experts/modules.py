@@ -24,7 +24,8 @@ class ExpertCache:
     __slots__ = ('entries', 'frequency', 'last_active', 'step',
                  '_proj_count', 'capacity', 'hits', 'misses',
                  'all_seen', 'load_calls', 'experts_loaded',
-                 'bytes_loaded', 'load_seconds', '_projections')
+                 'bytes_loaded', 'load_seconds', '_projections',
+                 'packed_slots', 'packed_weights', 'packed_dispatches')
 
     def __init__(self, capacity: int):
         self.entries: dict[int, dict[str, tuple]] = {}
@@ -41,6 +42,9 @@ class ExpertCache:
         self.bytes_loaded = 0
         self.load_seconds = 0.0
         self._projections: dict[str, CachedQuantizedSwitchLinear] = {}
+        self.packed_slots: dict[int, int] = {}
+        self.packed_weights: dict[str, tuple] = {}
+        self.packed_dispatches = 0
 
     def projection_called(self, expert_ids: np.ndarray) -> None:
         """Called once per projection. Increments step every 3rd call."""
@@ -67,6 +71,31 @@ class ExpertCache:
 
     def register_projection(self, projection) -> None:
         self._projections[projection._proj_name] = projection
+
+    def pack_hot_experts(self, count: int) -> int:
+        """Pin the hottest complete entries in reusable quantized buffers."""
+        complete = [
+            eid for eid, entry in self.entries.items()
+            if entry.keys() == self._projections.keys()
+        ]
+        expert_ids = sorted(sorted(complete, key=self._priority, reverse=True)[:count])
+        if not expert_ids:
+            return 0
+        for name in self._projections:
+            weights, scales, biases = zip(*(self.entries[eid][name] for eid in expert_ids))
+            w = mx.stack(weights)
+            s = mx.stack(scales)
+            b = mx.stack(biases) if biases[0] is not None else None
+            if b is None:
+                mx.eval(w, s)
+            else:
+                mx.eval(w, s, b)
+            self.packed_weights[name] = (w, s, b)
+            # The fallback shares packed storage instead of keeping a second copy.
+            for slot, eid in enumerate(expert_ids):
+                self.put(eid, name, w[slot], s[slot], b[slot] if b is not None else None)
+        self.packed_slots = {eid: slot for slot, eid in enumerate(expert_ids)}
+        return len(expert_ids)
 
     def load_projection_group(self, expert_ids: list[int]) -> None:
         """Load every missing projection for routed experts with one eval barrier."""
@@ -125,7 +154,7 @@ class ExpertCache:
             worst_id = None
             worst_p = float('inf')
             for eid in self.entries:
-                if eid in protected:
+                if eid in protected or eid in self.packed_slots:
                     continue
                 p = self._priority(eid)
                 if p < worst_p:
@@ -250,42 +279,27 @@ class CachedQuantizedSwitchLinear(nn.Module):
 
         self._cache.projection_called(unique_ids)
 
-        hit_ids = []
-        miss_ids = []
-        for eid in unique_ids:
-            eid = int(eid)
-            if self._cache.lookup(eid, self._proj_name) is not None:
-                hit_ids.append(eid)
-                self._cache.hits += 1
-            else:
-                miss_ids.append(eid)
-                self._cache.misses += 1
-
-        if miss_ids:
-            self._cache.load_projection_group(miss_ids)
-
-        protected = set(int(e) for e in unique_ids)
-        self._cache.evict_if_needed(protected)
-
-        all_ids = sorted(int(e) for e in unique_ids)
-        ws, ss, bs = [], [], []
-        has_bias = None
-        for eid in all_ids:
-            w, s, b = self._cache.lookup(eid, self._proj_name)
-            ws.append(w)
-            ss.append(s)
-            if has_bias is None:
-                has_bias = b is not None
-            if has_bias:
-                bs.append(b)
-
-        w_cat = mx.stack(ws)
-        s_cat = mx.stack(ss)
-        b_cat = mx.stack(bs) if has_bias else None
-
-        unique_sorted = np.array(all_ids, dtype=np.int32)
-        remap = np.empty(unique_sorted[-1] + 1, dtype=np.int32)
-        remap[unique_sorted] = np.arange(len(unique_sorted), dtype=np.int32)
+        cache = self._cache
+        all_ids = unique_ids.tolist()
+        packed = cache.packed_slots
+        remap = np.empty(all_ids[-1] + 1, dtype=np.int32)
+        if packed and all(eid in packed for eid in all_ids):
+            cache.hits += len(all_ids)
+            cache.packed_dispatches += 1
+            w_cat, s_cat, b_cat = cache.packed_weights[self._proj_name]
+            remap[unique_ids] = [packed[eid] for eid in all_ids]
+        else:
+            miss_ids = [eid for eid in all_ids if cache.lookup(eid, self._proj_name) is None]
+            cache.hits += len(all_ids) - len(miss_ids)
+            cache.misses += len(miss_ids)
+            if miss_ids:
+                cache.load_projection_group(miss_ids)
+            cache.evict_if_needed(set(all_ids))
+            weights, scales, biases = zip(*(cache.lookup(eid, self._proj_name) for eid in all_ids))
+            w_cat = mx.stack(weights)
+            s_cat = mx.stack(scales)
+            b_cat = mx.stack(biases) if biases[0] is not None else None
+            remap[unique_ids] = np.arange(len(all_ids), dtype=np.int32)
         remapped = mx.array(remap[indices_np].reshape(indices.shape))
 
         result = mx.gather_qmm(
