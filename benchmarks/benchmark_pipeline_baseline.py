@@ -1,4 +1,4 @@
-"""Compare single-host faithful expert streaming with two-host MLX-LM."""
+"""Compare single-host SSD streaming, resident pipelining, and SSD pipelining."""
 
 import argparse
 import importlib.metadata
@@ -125,7 +125,7 @@ def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens
         "prompt_tokens": len(prompt_ids),
         "generation_tokens": len(token_ids),
         "prefill_tps": len(prompt_ids) / (first - start),
-        "decode_tps": (len(token_ids) - 1) / (end - first),
+        "decode_tps": (len(token_ids) - 1) / (end - first) if len(token_ids) > 1 else 0.0,
         "peak_bytes": mx.get_peak_memory(),
         "finish_reason": "stop" if stopped else "length",
         "token_ids": token_ids,
@@ -135,7 +135,7 @@ def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("faithful", "pipeline"))
+    parser.add_argument("mode", choices=("faithful", "pipeline", "pipeline-ssd"))
     parser.add_argument("model", type=Path)
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument("--prompt-file", type=Path)
@@ -171,19 +171,29 @@ def main():
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
 
+    pipeline = args.mode != "faithful"
+    expert_streaming = args.mode != "pipeline"
+    host_sync = args.pipeline_host_sync or args.mode == "pipeline-ssd"
+    if expert_streaming:
+        from mlx_moe.lazy_experts.core import get_faithful_stats
+
     rank = 0
     mx.reset_peak_memory()
     startup = time.perf_counter()
-    if args.mode == "pipeline":
-        from mlx_lm.utils import sharded_load
-
+    if pipeline:
         group = mx.distributed.init(backend="ring", strict=True)
         if group.size() != 2:
             parser.error("pipeline mode requires two MLX ring ranks")
         rank = group.rank()
-        model, tokenizer = sharded_load(str(model_path), pipeline_group=group)
+        if expert_streaming:
+            from mlx_moe.lazy_experts.pipeline import load_faithful_pipeline_stage
+
+            model, tokenizer = load_faithful_pipeline_stage(model_path, group, args.capacity)
+        else:
+            from mlx_lm.utils import sharded_load
+
+            model, tokenizer = sharded_load(str(model_path), pipeline_group=group)
     else:
-        from mlx_moe.lazy_experts.core import get_faithful_stats
         from mlx_moe.lazy_experts.generate import _startup
 
         model, tokenizer, _ = _startup(
@@ -202,12 +212,15 @@ def main():
         "versions": {p: importlib.metadata.version(p) for p in ("mlx", "mlx-lm")},
         "prefill_step_size": args.prefill_step_size,
         "max_tokens": args.tokens,
-        "capacity": args.capacity if args.mode == "faithful" else None,
+        "capacity": args.capacity if expert_streaming else None,
     }
     if args.pipeline_synchronous:
         context["pipeline_synchronous"] = True
-    if args.pipeline_host_sync:
+    if host_sync:
         context["pipeline_host_sync"] = True
+    if args.mode == "pipeline-ssd":
+        context["layers_start"] = model.model.start_idx
+        context["layers_end_exclusive"] = model.model.end_idx
     loaded = {
         **context,
         "event": "loaded",
@@ -227,10 +240,10 @@ def main():
         for name, prompt in prompts.items()
     ]
     step = None
-    if args.pipeline_stage_only or args.pipeline_host_sync:
+    if args.pipeline_stage_only or host_sync:
         if model.model_type not in {"qwen3_5", "qwen3_5_moe"}:
             parser.error("this diagnostic requires a Qwen 3.5 model")
-    if args.pipeline_host_sync:
+    if host_sync:
         step = host_synchronized_step(mx, model, group)
     if args.pipeline_stage_only:
         _, formatted = formatted_prompts[0]
@@ -246,42 +259,15 @@ def main():
         trial_context = {**context, "event": "trial", "trial": trial, "prompt_name": name}
         if args.prompt_suite is not None:
             print(f"  Trial {trial}: {name}", flush=True)
-        if args.pipeline_synchronous or args.pipeline_host_sync:
+        before = get_faithful_stats(model) if expert_streaming else None
+        if args.pipeline_synchronous or host_sync:
             result = run_synchronous_pipeline(
                 mx, model, tokenizer, formatted, args.prefill_step_size, args.tokens, step
             )
-            print(json.dumps({**trial_context, **result}), flush=True)
-            continue
-        before = get_faithful_stats(model) if args.mode == "faithful" else None
-        token_ids = []
-        text = []
-        start = time.perf_counter()
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt=formatted,
-            max_tokens=args.tokens,
-            sampler=sampler,
-            prefill_step_size=args.prefill_step_size,
-        ):
-            if not token_ids:
-                first = time.perf_counter()
-            token_ids.append(int(response.token))
-            text.append(response.text)
-        elapsed = time.perf_counter() - start
-        result = {
-            **trial_context,
-            "ttft_s": first - start,
-            "elapsed_s": elapsed,
-            "prompt_tokens": response.prompt_tokens,
-            "generation_tokens": response.generation_tokens,
-            "prefill_tps": response.prompt_tps,
-            "decode_tps": response.generation_tps,
-            "peak_bytes": mx.get_peak_memory(),
-            "finish_reason": response.finish_reason,
-            "token_ids": token_ids,
-            "text": "".join(text),
-        }
+        else:
+            result = run_streaming_trial(
+                mx, model, tokenizer, formatted, args, sampler, stream_generate
+            )
         if before is not None:
             after = get_faithful_stats(model)
             experts = {
@@ -289,11 +275,42 @@ def main():
                 for key in ("hits", "misses", "load_calls", "bytes_loaded", "load_seconds")
             }
             experts["bytes_loaded_per_generated_token"] = (
-                experts["bytes_loaded"] / response.generation_tokens
+                experts["bytes_loaded"] / result["generation_tokens"]
             )
-            experts["load_time_fraction"] = experts["load_seconds"] / elapsed
+            experts["load_time_fraction"] = experts["load_seconds"] / result["elapsed_s"]
             result["experts"] = experts
-        print(json.dumps(result), flush=True)
+        print(json.dumps({**trial_context, **result}), flush=True)
+
+
+def run_streaming_trial(mx, model, tokenizer, prompt, args, sampler, stream_generate):
+    token_ids = []
+    text = []
+    start = time.perf_counter()
+    for response in stream_generate(
+        model,
+        tokenizer,
+        prompt=prompt,
+        max_tokens=args.tokens,
+        sampler=sampler,
+        prefill_step_size=args.prefill_step_size,
+    ):
+        if not token_ids:
+            first = time.perf_counter()
+        token_ids.append(int(response.token))
+        text.append(response.text)
+    elapsed = time.perf_counter() - start
+    return {
+        "ttft_s": first - start,
+        "elapsed_s": elapsed,
+        "prompt_tokens": response.prompt_tokens,
+        "generation_tokens": response.generation_tokens,
+        "prefill_tps": response.prompt_tps,
+        "decode_tps": response.generation_tps,
+        "peak_bytes": mx.get_peak_memory(),
+        "finish_reason": response.finish_reason,
+        "token_ids": token_ids,
+        "text": "".join(text),
+    }
 
 
 if __name__ == "__main__":

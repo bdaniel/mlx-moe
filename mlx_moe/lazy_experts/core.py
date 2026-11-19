@@ -92,9 +92,9 @@ def _enable_lazy(model, shard_map: dict) -> int:
     return replaced
 
 
-def _enable_cached(model, shard_map: dict, capacity: int) -> int:
+def _enable_cached(model, shard_map: dict, capacity: int, *, layer_offset: int = 0) -> int:
     replaced = 0
-    for i, layer in enumerate(model.layers):
+    for i, layer in enumerate(model.layers, start=layer_offset):
         switch, key_base = _find_switch_mlp(layer, i, shard_map=shard_map)
         if switch is None:
             continue

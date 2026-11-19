@@ -193,4 +193,50 @@ Compare task completion, invalid actions, elapsed time, and peak memory in the a
 
 The local checkpoint has 40 text layers. Safetensors headers show 9.463 GB of tensor payload in layers 0–19 and 9.463 GB in 20–39, plus 0.572 GB of embeddings, output head and final norm shared by the stages. A 20-layer stage therefore has about 10.04 GB of stored text weights if it retains all shared tensors. This is a weight estimate before cache, runtime buffers, Metal, and macOS memory.
 
-Use these measurements to decide whether to try Qwen3-Coder-Next with local SSD expert loading on both ranks. That experiment requires each rank to partition its layers before weights materialize, keep original layer indices for expert lookup, and maintain a stage-local memory budget. It is a separate runtime change.
+### Qwen3.5-35B coding suite results
+
+Each row is one pass over the same three prompts with up to 128 output tokens per prompt, using MLX 0.32.4 and MLX-LM 0.32.2. Times exclude model load. Pipeline times come from the mini, the output rank.
+
+| Setup | Suite time | Peak MLX allocation per host | Decode |
+| --- | ---: | ---: | ---: |
+| M1 Pro SSD, capacity 64 | 723.4 s | 6.49 GB | 1.6–2.2 tok/s |
+| M4 mini SSD, capacity 64 | 305.5 s | 6.46 GB | 3.8–4.7 tok/s |
+| M4 mini SSD, capacity 112 | 258.9 s | 9.66 GB | 4.2–6.0 tok/s |
+| M4 mini SSD, capacity 118 | 264.3 s | 10.06 GB | 4.2–5.3 tok/s |
+| M4 mini + M1 Pro, resident pipeline | 50.6 s | ~10.1 GB each | 39.0–39.5 tok/s |
+
+The pipeline was 5.2× faster than the capacity-118 mini run at nearly equal peak allocation on the mini. The pipeline also used about 10.1 GB on the MacBook. Both pipeline ranks agreed on all tokens. The mini SSD runs agreed across capacities, and one of the three prompts matched across all setups.
+
+### Qwen3.5-122B SSD smoke test
+
+After the download completes, run this on the Mac with the T7 attached. This starts with the benchmark's short default prompt and an eight-token budget. Record startup, time to first token, peak MLX allocation, and the expert loader counters.
+
+```zsh
+set -o pipefail
+mkdir -p logs/pipeline-baseline
+model="/Volumes/T7/AI/lmstudio/download"
+.venv-pipeline/bin/python benchmarks/check_metal.py &&
+  PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  .venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+    faithful "$model" --capacity 8 --prefill-step-size 4 --tokens 8 --repeat 1 2>&1 \
+  | tee "logs/pipeline-baseline/122b-ssd-$(date -u +%Y%m%dT%H%M%SZ).log"
+```
+
+### Validate SSD streaming on both ranks with the 35B checkpoint
+
+Use the same Ethernet hostfile and ranks as the resident run. Each Mac needs a full local copy of the checkpoint and the updated checkout. The loader opens the checkpoint lazily, removes the other rank's layers, and replaces its own expert weights before evaluating the remaining model parameters. At inference time it reads expert slices from the local SSD and sends activations over Ethernet.
+
+```zsh
+unset MLX_METAL_FAST_SYNCH
+set -o pipefail
+mkdir -p logs/pipeline-baseline
+model="$HOME/.lmstudio/models/mlx-community/Qwen3.5-35B-A3B-4bit"
+PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+  .venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+    pipeline-ssd "$model" --capacity 8 --prefill-step-size 4 --tokens 8 --repeat 1 2>&1 \
+  | tee "logs/pipeline-baseline/ssd-rank-${MLX_RANK}-$(date -u +%Y%m%dT%H%M%SZ).log"
+```
+
+Expect rank 0 to report layers `[20, 40)` and rank 1 to report `[0, 20)`. Both trial records should show positive expert bytes loaded and the same token IDs. The resident 35B run on the default prompt produced `[8160, 725, 264, 12654, 709, 421, 78161, 48142]` for these first eight tokens.
+
+Once the smoke test passes, use `--capacity 64 --tokens 128 --prompt-suite benchmarks/pipeline_coding_prompts.json` on both ranks. Compare elapsed time on rank 0 and peak MLX allocation and expert data loaded on each rank. Compare tokens with the resident run and record the first difference for any prompt that diverges.
