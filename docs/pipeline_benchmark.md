@@ -176,6 +176,30 @@ PYTHONPATH="$PWD" .venv-pipeline/bin/python "$runner" faithful "$model" --tokens
 
 Check that both ranks report the same prompt length and token IDs. Then compare rank 0's time to first token and decode rate against the single-Mac run. Report the first trial separately because later faithful trials reuse the expert cache. Inspect both ranks' peak memory and swap changes. The defaults exercise a short prompt and up to 64 output tokens. Repeat with the same longer `--prompt-file` on both modes when the smoke comparison completes.
 
+## Run the coding prompt suite on resident single-Mac models
+
+Run Bonsai 27B and GPT-OSS 20B on the mini to compare against the two-Mac coding prompt runs. Keep the same prompts, prefill chunk size, and output-token budget. Each model runs in a separate process so its allocations are released before the next model starts.
+
+```zsh
+set -o pipefail
+mkdir -p logs/pipeline-baseline
+(
+  set -e
+  .venv-pipeline/bin/python benchmarks/check_metal.py
+  for checkpoint in \
+    prism-ml/Ternary-Bonsai-27B-mlx-2bit \
+    mlx-community/gpt-oss-20b-OptiQ-4bit; do
+    PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" \
+      .venv-pipeline/bin/python -u benchmarks/benchmark_pipeline_baseline.py \
+      resident "$HOME/.lmstudio/models/$checkpoint" --prefill-step-size 16 \
+      --prompt-suite benchmarks/pipeline_coding_prompts.json --tokens 128 --repeat 2 2>&1 \
+      | tee "logs/pipeline-baseline/${checkpoint##*/}-resident-$(date -u +%Y%m%dT%H%M%SZ).log"
+  done
+)
+```
+
+Compare model load, time to first token, decode rate, and peak MLX memory. Each model uses its own tokenizer and chat template, so record prompt and output lengths alongside timing. GPT-OSS can spend its token budget on reasoning. Use the coding-agent benchmark below for test passes and task completion.
+
 ## Single-Mac coding-agent comparison
 
 Run all three models on the same Mac and benchmark environment after the Metal preflight passes. Use the existing scenarios and the same turn, token, and context settings. Bonsai and GPT-OSS run resident. Qwen uses faithful expert loading at capacity 32.

@@ -1,4 +1,4 @@
-"""Compare single-host SSD streaming, resident pipelining, and SSD pipelining."""
+"""Compare single-host and pipelined generation with resident or SSD weights."""
 
 import argparse
 import importlib.metadata
@@ -135,7 +135,7 @@ def run_synchronous_pipeline(mx, model, tokenizer, prompt, step_size, max_tokens
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("faithful", "pipeline", "pipeline-ssd"))
+    parser.add_argument("mode", choices=("resident", "faithful", "pipeline", "pipeline-ssd"))
     parser.add_argument("model", type=Path)
     prompt_source = parser.add_mutually_exclusive_group()
     prompt_source.add_argument("--prompt-file", type=Path)
@@ -171,8 +171,8 @@ def main():
     from mlx_lm import stream_generate
     from mlx_lm.sample_utils import make_sampler
 
-    pipeline = args.mode != "faithful"
-    expert_streaming = args.mode != "pipeline"
+    pipeline = args.mode in ("pipeline", "pipeline-ssd")
+    expert_streaming = args.mode in ("faithful", "pipeline-ssd")
     host_sync = args.pipeline_host_sync or args.mode == "pipeline-ssd"
     if expert_streaming:
         from mlx_moe.lazy_experts.core import get_faithful_stats
@@ -193,7 +193,7 @@ def main():
             from mlx_lm.utils import sharded_load
 
             model, tokenizer = sharded_load(str(model_path), pipeline_group=group)
-    else:
+    elif expert_streaming:
         from mlx_moe.lazy_experts.generate import _startup
 
         model, tokenizer, _ = _startup(
@@ -203,6 +203,11 @@ def main():
             warmup="none",
             expert_policy="faithful",
         )
+    else:
+        from mlx_moe.lazy_experts.generate import _load_model_and_tokenizer
+
+        model, tokenizer, _ = _load_model_and_tokenizer(str(model_path), lazy=True)
+        mx.eval(model.parameters())
 
     context = {
         "mode": args.mode,
